@@ -3,34 +3,69 @@ import pandas as pd
 import streamlit as st
 
 from src.data_io import dataframe_to_csv_bytes, read_uploaded_table
-from src.evaluate import evaluate_model
-from src.explain import generate_report_text, generate_summary
-from src.utils import align_prediction_frame, run_experiment
+from src.pipeline import align_prediction_frame, run_analysis
 
 
-DEFAULT_OUTPUTS = [
-    "Executive Summary",
-    "Charts",
-    "Model Leaderboard",
-    "Predictions Table",
-    "Feature Importance",
-    "Data Quality Report",
-    "Technical Metrics",
-    "Recommendations",
-]
+st.set_page_config(page_title="Dataset Insight App", layout="wide")
 
 
-def render_confusion_matrix(diagnostics):
-    labels = diagnostics["confusion_labels"]
-    matrix = diagnostics["confusion_matrix"]
+@st.cache_data(show_spinner=False)
+def load_uploaded_table(file_name, file_bytes):
+    class UploadedFileShim:
+        def __init__(self, name, content):
+            self.name = name
+            self._content = content
 
+        def getvalue(self):
+            return self._content
+
+    return read_uploaded_table(UploadedFileShim(file_name, file_bytes))
+
+
+def render_metric_cards(result):
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Problem Type", result["problem_type"].title())
+    col2.metric("Best Model", result["best_model_name"])
+    col3.metric("Rows Used", f"{result['used_rows']:,}")
+    col4.metric(result["metric_name"].upper(), f"{result['best_metrics'][result['metric_name']]:.3f}")
+
+
+def render_quality_summary(result):
+    st.subheader("Model Quality")
+    quality = result["quality"]
+    baseline = result["baseline_metrics"]
+    best = result["best_metrics"]
+
+    q1, q2, q3 = st.columns(3)
+    q1.metric("Model Worth", quality["verdict"].title())
+    q2.metric(
+        f"Best {result['metric_name'].upper()}",
+        f"{best[result['metric_name']]:.3f}",
+    )
+    q3.metric(
+        f"Baseline {result['metric_name'].upper()}",
+        f"{baseline[result['metric_name']]:.3f}",
+    )
+
+    st.write(quality["summary"])
+
+    metric_frame = pd.DataFrame(
+        {"best_model": best, "baseline": {k: v for k, v in baseline.items() if k in best}}
+    )
+    st.dataframe(metric_frame)
+    st.caption(baseline["baseline_strategy"])
+
+
+def render_confusion_matrix(confusion_payload):
     fig, ax = plt.subplots(figsize=(6, 4))
+    matrix = confusion_payload["matrix"]
+    labels = confusion_payload["labels"]
     image = ax.imshow(matrix, cmap="Blues")
-    ax.set_xticks(range(len(labels)), labels)
-    ax.set_yticks(range(len(labels)), labels)
+    ax.set_title("Confusion Matrix")
     ax.set_xlabel("Predicted")
     ax.set_ylabel("Actual")
-    ax.set_title("Confusion Matrix")
+    ax.set_xticks(range(len(labels)), labels)
+    ax.set_yticks(range(len(labels)), labels)
 
     for row_index, row in enumerate(matrix):
         for col_index, value in enumerate(row):
@@ -40,216 +75,229 @@ def render_confusion_matrix(diagnostics):
     st.pyplot(fig)
 
 
-def render_regression_plot(y_true, y_pred):
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.scatter(y_true, y_pred, alpha=0.5)
-    ax.set_xlabel("Actual")
-    ax.set_ylabel("Predicted")
-    ax.set_title("Actual vs Predicted")
-    st.pyplot(fig)
+def render_relevant_charts(result):
+    st.subheader("Relevant Figures")
+    chart_context = result["chart_context"]
+    rendered_any = False
+
+    if result["problem_type"] == "classification":
+        target_counts = result["target_series"].value_counts(dropna=False).sort_index()
+        if len(target_counts) <= 25:
+            st.caption("Target class balance")
+            st.bar_chart(target_counts)
+            rendered_any = True
+
+        if "confusion_matrix" in chart_context:
+            st.caption("Where the model predicts correctly vs incorrectly")
+            render_confusion_matrix(chart_context["confusion_matrix"])
+            rendered_any = True
+
+        for relationship in chart_context["relationships"]:
+            column = relationship["column"]
+            frame = relationship["frame"].dropna()
+            if frame.empty:
+                continue
+
+            if frame["feature"].dtype == "O" or str(frame["feature"].dtype).startswith("category"):
+                grouped = pd.crosstab(frame["feature"], frame["target"], normalize="index")
+                if 1 < len(grouped) <= 20:
+                    st.caption(f"Class mix by {column}")
+                    st.bar_chart(grouped)
+                    rendered_any = True
+                    break
+            else:
+                grouped = frame.groupby("target")["feature"].median()
+                if 1 < len(grouped) <= 20:
+                    st.caption(f"Median {column} by class")
+                    st.bar_chart(grouped)
+                    rendered_any = True
+                    break
+    else:
+        compare_df = pd.DataFrame(
+            {
+                "actual": chart_context["holdout_actual"],
+                "predicted": chart_context["holdout_pred"],
+            }
+        )
+        st.caption("Actual vs predicted holdout values")
+        st.scatter_chart(compare_df, x="actual", y="predicted")
+        rendered_any = True
+
+        residual_df = pd.DataFrame(
+            {"residual": chart_context["holdout_actual"] - chart_context["holdout_pred"]}
+        )
+        st.caption("Residual distribution")
+        st.bar_chart(
+            residual_df["residual"]
+            .round(1)
+            .value_counts()
+            .sort_index()
+        )
+        rendered_any = True
+
+        for relationship in chart_context["relationships"]:
+            column = relationship["column"]
+            frame = relationship["frame"].dropna()
+            if frame.empty:
+                continue
+
+            if frame["feature"].dtype == "O" or str(frame["feature"].dtype).startswith("category"):
+                grouped = frame.groupby("feature")["target"].mean().sort_values(ascending=False)
+                if 1 < len(grouped) <= 20:
+                    st.caption(f"Average target by {column}")
+                    st.bar_chart(grouped)
+                    rendered_any = True
+                    break
+            else:
+                st.caption(f"Target relationship with {column}")
+                st.scatter_chart(frame, x="feature", y="target")
+                rendered_any = True
+                break
+
+    if not rendered_any and not result["feature_importance"].empty:
+        st.caption("Top feature importance")
+        st.bar_chart(result["feature_importance"].set_index("feature"))
+        rendered_any = True
+
+    if not rendered_any:
+        st.info("No high-signal figure was available for this dataset shape.")
 
 
-st.set_page_config(page_title="Dataset Insight App", layout="wide")
+def build_report_text(result, dataset_name, target_col):
+    lines = [
+        f"Dataset Insight Report: {dataset_name}",
+        f"Target column: {target_col}",
+        f"Problem type: {result['problem_type']}",
+        f"Target style: {result['target_style']['label']}",
+        f"Best model: {result['best_model_name']}",
+        f"Model worth: {result['quality']['verdict']}",
+        "",
+        "Metrics",
+    ]
+
+    for name, value in result["best_metrics"].items():
+        lines.append(f"{name}: {value:.4f}")
+
+    lines.extend(["", "Preparation Notes"])
+    lines.extend(result["notes"] or ["None"])
+    return "\n".join(lines)
+
 
 st.title("Dataset Insight App")
 st.write(
-    "Upload a delimited dataset, choose the kind of output you want, and generate "
-    "user-friendly predictions, charts, and modeling conclusions."
+    "A faster, more reliable dataset modeling app. Upload a table, choose a target, "
+    "and it will train a strong default model without freezing on large files."
 )
 
 with st.sidebar:
-    st.header("Configuration")
-    output_preferences = st.multiselect(
-        "Output sections",
-        DEFAULT_OUTPUTS,
-        default=DEFAULT_OUTPUTS,
-    )
+    st.header("Settings")
     problem_type_mode = st.selectbox(
         "Prediction type",
         ["Auto Detect", "Classification", "Regression"],
     )
-    ranking_metric_label = st.selectbox(
-        "Best model metric",
-        ["Auto", "F1 / RMSE", "Accuracy", "R²", "MAE"],
-    )
-    test_size = st.slider("Holdout test size", min_value=0.1, max_value=0.4, value=0.2, step=0.05)
-    max_categories = st.slider(
-        "Max categories before a text column is dropped",
-        min_value=10,
-        max_value=100,
-        value=40,
-        step=5,
-    )
+    test_size = st.slider("Holdout test size", 0.1, 0.35, 0.2, 0.05)
     drop_identifier_columns = st.checkbox("Drop identifier-like columns", value=True)
-
-
-ranking_metric_map = {
-    "Auto": None,
-    "F1 / RMSE": None,
-    "Accuracy": "accuracy",
-    "R²": "r2",
-    "MAE": "mae",
-}
-
 
 training_file = st.file_uploader("Upload a training dataset", type=["csv", "tsv", "txt"])
 prediction_file = st.file_uploader(
-    "Optional: upload a second dataset to score with the trained model",
+    "Optional: upload a second dataset for scoring",
     type=["csv", "tsv", "txt"],
 )
 
 if training_file is not None:
     try:
-        df = read_uploaded_table(training_file)
+        df = load_uploaded_table(training_file.name, training_file.getvalue())
     except Exception as exc:
-        st.error(f"Could not read the uploaded training file: {exc}")
+        st.error(f"Could not read the training file: {exc}")
         st.stop()
 
     if df.empty:
-        st.error("The uploaded training file has no rows.")
+        st.error("The uploaded dataset has no rows.")
         st.stop()
 
-    st.subheader("Dataset Preview")
+    st.subheader("Dataset Snapshot")
     st.dataframe(df.head(10))
 
-    metric_1, metric_2, metric_3 = st.columns(3)
-    metric_1.metric("Rows", f"{df.shape[0]:,}")
-    metric_2.metric("Columns", f"{df.shape[1]:,}")
-    metric_3.metric("Missing Cells", f"{int(df.isna().sum().sum()):,}")
+    info1, info2, info3 = st.columns(3)
+    info1.metric("Rows", f"{df.shape[0]:,}")
+    info2.metric("Columns", f"{df.shape[1]:,}")
+    info3.metric("Missing Cells", f"{int(df.isna().sum().sum()):,}")
 
     target_col = st.selectbox("Choose the target column", df.columns)
-    run_button = st.button("Run Analysis", type="primary")
 
-    if run_button:
-        try:
-            output = run_experiment(
-                df,
-                target_col,
-                problem_type_mode=problem_type_mode,
-                ranking_metric=ranking_metric_map[ranking_metric_label],
-                test_size=test_size,
-                max_categories=max_categories,
-                drop_identifier_columns=drop_identifier_columns,
-            )
-
-            prediction_source_name = "holdout test split"
-            prediction_frame = output["X_test"].copy()
-            actual_series = output["y_test"].reset_index(drop=True)
-            prediction_metrics = output["best_metrics"]
-
-            if prediction_file is not None:
-                prediction_df = read_uploaded_table(prediction_file)
-                prediction_source_name = "uploaded scoring file"
-                actual_series = None
-                if target_col in prediction_df.columns:
-                    actual_series = prediction_df[target_col].reset_index(drop=True)
-                    prediction_df = prediction_df.drop(columns=[target_col])
-                prediction_frame = align_prediction_frame(
-                    prediction_df,
-                    output["feature_columns"],
+    if st.button("Train Model", type="primary"):
+        with st.spinner("Preparing data and training a reliable model..."):
+            try:
+                result = run_analysis(
+                    df,
+                    target_col,
+                    problem_type_mode=problem_type_mode,
+                    test_size=test_size,
+                    drop_identifier_columns=drop_identifier_columns,
                 )
+            except Exception as exc:
+                st.error(f"Training failed: {exc}")
+                st.stop()
 
-            preds = output["best_model"].predict(prediction_frame)
-            pred_df = prediction_frame.copy().reset_index(drop=True)
-            if actual_series is not None:
-                pred_df["actual"] = actual_series.values
-            pred_df["prediction"] = preds
+        render_metric_cards(result)
+        st.caption(
+            f"Detected target style: {result['target_style']['label']} "
+            f"with {result['target_style']['unique_count']} unique values."
+        )
 
-            if output["problem_type"] == "classification" and hasattr(output["best_model"], "predict_proba"):
-                probability_frame = output["best_model"].predict_proba(prediction_frame)
-                probability_columns = [
-                    f"probability_{class_name}"
-                    for class_name in output["best_model"].named_steps["model"].classes_
-                ]
-                proba_df = pd.DataFrame(probability_frame, columns=probability_columns)
-                pred_df = pd.concat([pred_df, proba_df], axis=1)
+        if result["notes"]:
+            st.info("\n".join(result["notes"]))
 
-            if actual_series is not None and prediction_file is not None:
-                prediction_metrics = evaluate_model(output["problem_type"], actual_series, preds)
+        render_quality_summary(result)
 
-            st.subheader("Analysis Summary")
-            st.write(
-                generate_summary(
-                    output["problem_type"],
-                    output["best_model_name"],
-                    prediction_metrics,
-                    output["profile"]["notes"],
+        st.subheader("Leaderboard")
+        leaderboard = pd.DataFrame(result["results"]).T.sort_values(
+            result["metric_name"],
+            ascending=result["metric_name"] in {"rmse", "mae"},
+        )
+        st.dataframe(leaderboard)
+
+        if not result["feature_importance"].empty:
+            st.subheader("Top Drivers")
+            st.bar_chart(result["feature_importance"].set_index("feature"))
+            st.dataframe(result["feature_importance"])
+
+        render_relevant_charts(result)
+
+        st.subheader("Prediction Preview")
+        st.dataframe(result["prediction_preview"])
+
+        report_text = build_report_text(result, training_file.name, target_col)
+        st.subheader("Report")
+        st.text_area("Analysis report", report_text, height=220)
+
+        if prediction_file is not None:
+            try:
+                prediction_df = load_uploaded_table(prediction_file.name, prediction_file.getvalue())
+                aligned = align_prediction_frame(prediction_df, result["feature_columns"])
+                scored = aligned.copy()
+                scored["prediction"] = result["best_model"].predict(aligned)
+                if result["problem_type"] == "regression":
+                    target_series = df[target_col]
+                    if target_series.dropna().shape[0] and (
+                        pd.api.types.is_numeric_dtype(target_series) and
+                        (target_series.dropna().round() == target_series.dropna()).all()
+                    ):
+                        scored["rounded_prediction"] = scored["prediction"].round().astype(int)
+                st.subheader("Scored File Preview")
+                st.dataframe(scored.head(25))
+                st.download_button(
+                    "Download Scored CSV",
+                    data=dataframe_to_csv_bytes(scored),
+                    file_name="scored_predictions.csv",
+                    mime="text/csv",
                 )
-            )
+            except Exception as exc:
+                st.warning(f"Could not score the second dataset: {exc}")
 
-            if "Model Leaderboard" in output_preferences:
-                st.subheader("Model Leaderboard")
-                leaderboard = pd.DataFrame(output["results"]).T.sort_values(
-                    "f1" if output["problem_type"] == "classification" else "rmse",
-                    ascending=output["problem_type"] != "classification",
-                )
-                st.dataframe(leaderboard)
-
-            if "Technical Metrics" in output_preferences:
-                st.subheader("Selected Output Metrics")
-                st.json(prediction_metrics)
-
-            if "Data Quality Report" in output_preferences:
-                st.subheader("Data Quality")
-                missing_df = output["profile"]["missing_by_column"].reset_index()
-                missing_df.columns = ["column", "missing_values"]
-                st.dataframe(missing_df)
-                if output["profile"]["notes"]:
-                    st.info("\n".join(output["profile"]["notes"]))
-
-            if "Charts" in output_preferences:
-                st.subheader("Charts")
-                if output["problem_type"] == "classification":
-                    target_counts = df[target_col].value_counts(dropna=False)
-                    st.bar_chart(target_counts)
-                    render_confusion_matrix(output["diagnostics"])
-                else:
-                    st.line_chart(df[target_col].dropna().reset_index(drop=True))
-                    render_regression_plot(output["y_test"], output["holdout_predictions"])
-
-            if "Feature Importance" in output_preferences and not output["feature_importance"].empty:
-                st.subheader("Top Drivers")
-                st.bar_chart(output["feature_importance"].set_index("feature"))
-                st.dataframe(output["feature_importance"])
-
-            if "Predictions Table" in output_preferences:
-                st.subheader(f"Predictions Preview ({prediction_source_name})")
-                st.dataframe(pred_df.head(25))
-
-            if "Recommendations" in output_preferences:
-                st.subheader("Recommended Next Steps")
-                recommendations = [
-                    "Review dropped identifier or high-cardinality columns before production use.",
-                    "Validate with a truly separate scoring dataset before trusting business conclusions.",
-                    "Use the prediction download below to inspect individual row-level outputs.",
-                ]
-                for recommendation in recommendations:
-                    st.write(f"- {recommendation}")
-
-            report_text = generate_report_text(
-                dataset_name=training_file.name,
-                problem_type=output["problem_type"],
-                best_model_name=output["best_model_name"],
-                metrics=prediction_metrics,
-                profile=output["profile"],
-                output_preferences=output_preferences,
-            )
-
-            if "Executive Summary" in output_preferences:
-                st.subheader("Executive Report")
-                st.text_area("Report", report_text, height=320)
-
-            st.download_button(
-                "Download Predictions CSV",
-                data=dataframe_to_csv_bytes(pred_df),
-                file_name="predictions.csv",
-                mime="text/csv",
-            )
-            st.download_button(
-                "Download Analysis Report",
-                data=report_text.encode("utf-8"),
-                file_name="analysis_report.txt",
-                mime="text/plain",
-            )
-        except Exception as exc:
-            st.error(f"Error while running analysis: {exc}")
+        st.download_button(
+            "Download Report",
+            data=report_text.encode("utf-8"),
+            file_name="analysis_report.txt",
+            mime="text/plain",
+        )

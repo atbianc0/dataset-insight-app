@@ -3,7 +3,7 @@ from sklearn.pipeline import Pipeline
 
 from src.evaluate import build_diagnostic_artifacts, evaluate_model, summarize_target
 from src.preprocess import build_preprocessor, prepare_features
-from src.train import detect_problem_type, get_models, split_data
+from src.train import detect_problem_type, get_models, is_integer_like, split_data
 
 
 def choose_best_model(problem_type, results, ranking_metric=None):
@@ -104,6 +104,26 @@ def profile_dataset(df, target_col=None):
     }
 
 
+def describe_target(y, problem_type):
+    is_numeric = pd.api.types.is_numeric_dtype(y)
+    unique_count = int(y.nunique(dropna=False))
+    integer_like = bool(is_numeric and is_integer_like(y))
+
+    if problem_type == "classification":
+        recommendation = "categorical classification"
+    elif integer_like and y.min() >= 0:
+        recommendation = "count-style regression"
+    else:
+        recommendation = "numeric regression"
+
+    return {
+        "is_numeric": bool(is_numeric),
+        "unique_count": unique_count,
+        "integer_like": integer_like,
+        "recommendation": recommendation,
+    }
+
+
 def run_experiment(
     df,
     target_col,
@@ -120,6 +140,7 @@ def run_experiment(
         if problem_type_mode == "Auto Detect"
         else problem_type_mode.lower()
     )
+    target_characteristics = describe_target(y, problem_type)
 
     if problem_type == "classification" and y.nunique(dropna=False) < 2:
         raise ValueError("Classification needs at least two target classes to train a model.")
@@ -138,6 +159,10 @@ def run_experiment(
         raise ValueError("No supported feature columns were found in the uploaded dataset.")
 
     dataset_profile = profile_dataset(cleaned_df, target_col=target_col)
+    if problem_type_mode == "Auto Detect":
+        dataset_profile["notes"].append(
+            f"Auto-detected {problem_type} based on target shape ({target_characteristics['recommendation']})."
+        )
     dataset_profile["notes"].extend(
         [f"Dropped {col}: {reason}" for col, reason in prepared["dropped_columns"]]
     )
@@ -200,5 +225,7 @@ def run_experiment(
         "feature_importance": build_feature_importance_frame(best_model, transformed_feature_names),
         "profile": dataset_profile,
         "target_summary": summarize_target(y, problem_type),
+        "target_characteristics": target_characteristics,
         "diagnostics": build_diagnostic_artifacts(problem_type, y_test, holdout_preds),
+        "ranking_metric": ranking_metric or ("f1" if problem_type == "classification" else "rmse"),
     }
