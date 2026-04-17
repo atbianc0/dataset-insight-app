@@ -3,7 +3,7 @@ import pandas as pd
 import streamlit as st
 
 from src.data_io import dataframe_to_csv_bytes, read_uploaded_table
-from src.pipeline import align_prediction_frame, run_analysis
+from src.pipeline import align_prediction_frame, recommend_target_columns, run_analysis
 
 
 st.set_page_config(page_title="Dataset Insight App", layout="wide")
@@ -195,6 +195,11 @@ with st.sidebar:
         "Prediction type",
         ["Auto Detect", "Classification", "Regression"],
     )
+    training_effort = st.selectbox(
+        "Training effort",
+        ["Standard", "Expanded"],
+        help="Expanded tries more complex models and usually takes longer.",
+    )
     test_size = st.slider("Holdout test size", 0.1, 0.35, 0.2, 0.05)
     drop_identifier_columns = st.checkbox("Drop identifier-like columns", value=True)
 
@@ -223,6 +228,10 @@ if training_file is not None:
     info2.metric("Columns", f"{df.shape[1]:,}")
     info3.metric("Missing Cells", f"{int(df.isna().sum().sum()):,}")
 
+    st.subheader("Recommended Targets")
+    recommended_targets = recommend_target_columns(df)
+    st.dataframe(recommended_targets)
+
     target_col = st.selectbox("Choose the target column", df.columns)
 
     if st.button("Train Model", type="primary"):
@@ -234,9 +243,17 @@ if training_file is not None:
                     problem_type_mode=problem_type_mode,
                     test_size=test_size,
                     drop_identifier_columns=drop_identifier_columns,
+                    training_effort=training_effort.lower(),
                 )
             except Exception as exc:
-                st.error(f"Training failed: {exc}")
+                message = str(exc)
+                if "contains NaN" in message:
+                    message = (
+                        "The selected target column still contains invalid or missing values after cleaning. "
+                        "Try re-uploading the file, checking the target column for blanks like 'unknown' or "
+                        "'null', or choosing a different target."
+                    )
+                st.error(f"Training failed: {message}")
                 st.stop()
 
         render_metric_cards(result)

@@ -4,3 +4,8 @@ __pycache__/
 .DS_Store
 models/*.pkl
 outputs/*.csv
+sample_data/creditcard.csv
+sample_data/creditcard.csv
+sample_data/creditcard.csv
+
+sample_data/creditcard.csv
