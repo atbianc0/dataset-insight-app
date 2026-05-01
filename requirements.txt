@@ -3,3 +3,6 @@ numpy
 scikit-learn
 streamlit
 matplotlib
+pytest
+openpyxl
+openai

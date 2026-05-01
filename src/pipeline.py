@@ -1,5 +1,4 @@
 import os
-import re
 import warnings
 
 os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
@@ -30,53 +29,121 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
 
+from src.extensions import AnalysisContext, DEFAULT_EXTENSION_REGISTRY
+from src.heuristics import (
+    classify_general_column_role as _classify_general_column_role,
+    is_datetime_candidate as _is_datetime_candidate,
+    is_identifier_like as _is_identifier_like,
+    is_integer_like,
+    is_text_heavy as _is_text_heavy_target,
+    normalize_missing_tokens,
+    numeric_conversion_ratio,
+    safe_ratio,
+    tokenize_column_name as _tokenize_column_name,
+    word_count as _word_count,
+)
+from src.insights import run_insight_analysis
+
 
 MAX_PREVIEW_ROWS = 25
 MAX_CHART_ROWS = 5000
 BENCHMARK_ROWS = 20000
 MAX_TRAIN_ROWS = 60000
 HIGH_CARDINALITY_LIMIT = 80
-COMMON_MISSING_TOKENS = {
-    "",
-    " ",
-    "na",
-    "n/a",
-    "nan",
-    "none",
-    "null",
-    "unknown",
-    "?",
-    "-",
-    "--",
+MIN_PREDICTION_ROWS = 30
+POSITIVE_TARGET_KEYWORDS = {
+    "amount",
+    "approved",
+    "churn",
+    "class",
+    "conversion",
+    "default",
+    "defect",
+    "demand",
+    "failed",
+    "fraud",
+    "grade",
+    "label",
+    "loss",
+    "outcome",
+    "passed",
+    "price",
+    "probability",
+    "result",
+    "retained",
+    "revenue",
+    "risk",
+    "sales",
+    "score",
+    "segment",
+    "status",
+    "success",
+    "survived",
+    "target",
+    "type",
+    "value",
+}
+NEGATIVE_TARGET_KEYWORDS = {
+    "address",
+    "cast",
+    "comment",
+    "customer",
+    "description",
+    "director",
+    "email",
+    "first",
+    "last",
+    "latitude",
+    "longitude",
+    "message",
+    "name",
+    "notes",
+    "phone",
+    "text",
+    "title",
+    "url",
+    "uuid",
+}
+GROUP_TOKEN_STOPWORDS = {
+    "actual",
+    "class",
+    "label",
+    "level",
+    "result",
+    "score",
+    "status",
+    "target",
+    "type",
+    "value",
+}
+TEMPORAL_TARGET_KEYWORDS = {
+    "created",
+    "date",
+    "day",
+    "month",
+    "released",
+    "time",
+    "timestamp",
+    "updated",
+    "year",
 }
 
 
-def is_integer_like(series, tolerance=1e-9):
-    non_null = series.dropna()
-    if non_null.empty:
-        return False
-
-    numeric_values = pd.to_numeric(non_null, errors="coerce")
-    if numeric_values.isna().any():
-        return False
-
-    numeric_array = numeric_values.to_numpy(dtype=float, na_value=np.nan)
-    return np.all(np.isclose(numeric_array, np.round(numeric_array), atol=tolerance))
-
-
-def numeric_conversion_ratio(series):
-    non_null = pd.Series(series).dropna()
-    if non_null.empty:
-        return 0.0
-    numeric_values = pd.to_numeric(non_null, errors="coerce")
-    return float(numeric_values.notna().mean())
-
-
-def normalize_missing_tokens(series):
-    if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
-        normalized = series.astype("string").str.strip()
-        return normalized.where(~normalized.str.lower().isin(COMMON_MISSING_TOKENS), pd.NA)
-    return series
+def _collect_assistant_extensions(
+    extension_registry,
+    df,
+    target_col=None,
+    artifacts=None,
+    metadata=None,
+):
+    registry = extension_registry or DEFAULT_EXTENSION_REGISTRY
+    context = AnalysisContext(
+        df=df,
+        target_col=target_col,
+        artifacts=artifacts or {},
+        metadata=metadata or {},
+    )
+    return registry.collect(context)
 
 
 def sanitize_dataframe(df):
@@ -176,22 +243,6 @@ def is_count_regression_target(y, problem_type):
     )
 
 
-def _is_datetime_candidate(series):
-    if pd.api.types.is_datetime64_any_dtype(series):
-        return True
-    if pd.api.types.is_numeric_dtype(series):
-        return False
-
-    sample = series.dropna().astype(str).head(150)
-    if sample.empty:
-        return False
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        parsed = pd.to_datetime(sample, errors="coerce")
-    return parsed.notna().mean() >= 0.85
-
-
 def _expand_datetime_column(series, name):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
@@ -204,25 +255,6 @@ def _expand_datetime_column(series, name):
             f"{name}__dayofweek": parsed.dt.dayofweek,
         }
     )
-
-
-def _is_identifier_like(series, name):
-    non_null = series.dropna()
-    if non_null.empty:
-        return False
-    unique_ratio = non_null.nunique() / len(non_null)
-    lower = name.lower()
-    if "id" in lower and unique_ratio > 0.75:
-        return True
-
-    if pd.api.types.is_numeric_dtype(non_null):
-        if is_integer_like(non_null):
-            diffs = pd.Series(non_null).sort_values().diff().dropna()
-            mostly_step_one = not diffs.empty and (diffs == 1).mean() > 0.9
-            return unique_ratio > 0.98 and non_null.nunique() > 25 and mostly_step_one
-        return False
-
-    return unique_ratio > 0.995 and non_null.nunique() > 100
 
 
 def _split_multi_value_text(series):
@@ -245,69 +277,665 @@ def _extract_numeric_text_parts(series):
     return numbers, units
 
 
-def _word_count(series):
-    return series.fillna("").astype(str).str.split().str.len()
+def _describe_target_shape(series, problem_type):
+    unique_count = int(series.nunique(dropna=True))
+    if problem_type == "classification":
+        if unique_count == 2:
+            return "Binary label"
+        return "Categorical outcome"
+    if problem_type == "regression":
+        if is_integer_like(series):
+            return "Numeric count / amount"
+        return "Numeric outcome"
+    return "Unclear target shape"
 
-
-def recommend_target_columns(df, top_n=5):
-    recommendations = []
+def _build_feature_subset_summary(df):
+    likely_useful = []
+    risky = []
+    avoid = []
 
     for column in df.columns:
         series = df[column]
-        non_null_ratio = 1 - (series.isna().mean())
-        unique_count = series.nunique(dropna=True)
-        unique_ratio = unique_count / max(series.dropna().shape[0], 1)
-        lower = column.lower()
+        role = _classify_general_column_role(series, column)
+        missing_ratio = float(series.isna().mean())
+        unique_count = int(series.nunique(dropna=True))
 
-        score = 0.0
-        reasons = []
-
-        if _is_identifier_like(series, column):
-            score -= 3
-            reasons.append("identifier-like")
-
-        if non_null_ratio < 0.6:
-            score -= 1
-            reasons.append("many missing values")
+        if series.isna().all() or unique_count <= 1:
+            avoid.append(
+                {
+                    "column": column,
+                    "role": "Empty / constant",
+                    "guidance": "Exclude from modeling",
+                    "reason": "All values are missing or constant, so the column cannot add signal.",
+                }
+            )
+        elif role == "identifier":
+            avoid.append(
+                {
+                    "column": column,
+                    "role": "Identifier-like",
+                    "guidance": "Exclude from modeling",
+                    "reason": "Identifier-style values usually memorize rows instead of generalizing.",
+                }
+            )
+        elif role == "text":
+            avoid.append(
+                {
+                    "column": column,
+                    "role": "Long text",
+                    "guidance": "Summarize instead",
+                    "reason": "Long-form text is better summarized than directly modeled in this app.",
+                }
+            )
+        elif missing_ratio >= 0.45:
+            risky.append(
+                {
+                    "column": column,
+                    "role": role.replace("_", " ").title(),
+                    "guidance": "Use carefully",
+                    "reason": f"High missingness ({missing_ratio:.1%}) could weaken both analysis and prediction.",
+                }
+            )
+        elif role == "datetime":
+            likely_useful.append(
+                {
+                    "column": column,
+                    "role": "Date / time",
+                    "guidance": "Keep for trends or derived features",
+                    "reason": "Date-like columns can support trend summaries or derived time parts.",
+                }
+            )
+        elif role in {"numeric", "boolean"}:
+            likely_useful.append(
+                {
+                    "column": column,
+                    "role": role.replace("_", " ").title(),
+                    "guidance": "Strong general-purpose input",
+                    "reason": "Structured numeric values are useful for summaries, correlations, and models.",
+                }
+            )
+        elif role == "categorical":
+            likely_useful.append(
+                {
+                    "column": column,
+                    "role": "Categorical",
+                    "guidance": "Usually useful",
+                    "reason": "Low or medium-cardinality categories often help grouping and classification.",
+                }
+            )
         else:
-            score += 0.5
+            risky.append(
+                {
+                    "column": column,
+                    "role": "High-cardinality category",
+                    "guidance": "Check before modeling",
+                    "reason": "High-cardinality categories may need encoding and can be noisy.",
+                }
+            )
 
-        if any(keyword in lower for keyword in ["target", "label", "class", "fraud", "churn", "rating", "score", "amount", "price", "revenue", "sales", "type"]):
+    return {
+        "likely_useful": likely_useful[:12],
+        "risky": risky[:12],
+        "avoid": avoid[:12],
+        "counts": {
+            "likely_useful": len(likely_useful),
+            "risky": len(risky),
+            "avoid": len(avoid),
+        },
+    }
+
+
+def _detect_multi_target_groups(candidates):
+    viable = [
+        candidate for candidate in candidates
+        if candidate["status"] in {"recommended", "possible"} and candidate["problem_type"] in {"classification", "regression"}
+    ]
+    groups = {}
+
+    def add_group(label, columns, problem_type, reason):
+        key = tuple(sorted(columns))
+        if len(key) < 2:
+            return
+        average_score = round(
+            float(np.mean([candidate["score"] for candidate in viable if candidate["column"] in key])),
+            2,
+        )
+        existing = groups.get(key)
+        payload = {
+            "group_label": label,
+            "columns": list(key),
+            "problem_type": problem_type,
+            "reason": reason,
+            "average_score": average_score,
+        }
+        if existing is None or payload["average_score"] > existing["average_score"]:
+            groups[key] = payload
+
+    prefixes = {}
+    suffixes = {}
+    token_groups = {}
+
+    for candidate in viable:
+        tokens = _tokenize_column_name(candidate["column"])
+        if not tokens:
+            continue
+        prefix = tokens[0]
+        suffix = tokens[-1]
+        if len(prefix) > 2:
+            prefixes.setdefault((candidate["problem_type"], prefix), []).append(candidate["column"])
+        if len(suffix) > 2:
+            suffixes.setdefault((candidate["problem_type"], suffix), []).append(candidate["column"])
+        for token in tokens:
+            if len(token) > 2 and token not in GROUP_TOKEN_STOPWORDS:
+                token_groups.setdefault((candidate["problem_type"], token), []).append(candidate["column"])
+
+    for (problem_type, token), columns in prefixes.items():
+        if len(columns) >= 2:
+            add_group(
+                f"Shared prefix: {token}",
+                columns,
+                problem_type,
+                f"These columns share the '{token}' prefix and may represent related outcomes worth modeling together.",
+            )
+    for (problem_type, token), columns in suffixes.items():
+        if len(columns) >= 2:
+            add_group(
+                f"Shared suffix: {token}",
+                columns,
+                problem_type,
+                f"These columns share the '{token}' outcome style and may support multi-target prediction.",
+            )
+    for (problem_type, token), columns in token_groups.items():
+        if len(columns) >= 2:
+            add_group(
+                f"Shared token: {token}",
+                columns,
+                problem_type,
+                f"These targets all reference '{token}', which suggests a related family of outcomes.",
+            )
+
+    frame = pd.DataFrame(groups.values())
+    if frame.empty:
+        return []
+    frame = frame.sort_values(["average_score", "group_label"], ascending=[False, True])
+    return frame.to_dict(orient="records")
+
+
+def evaluate_target_candidate(df, column, drop_identifier_columns=True):
+    if column not in df.columns:
+        raise ValueError(f"Target column '{column}' was not found.")
+
+    raw_series = df[column]
+    series = sanitize_target_series(raw_series)
+    non_null = series.dropna()
+    usable_rows = int(len(non_null))
+    missing_ratio = 1 - safe_ratio(usable_rows, len(df))
+    unique_count = int(non_null.nunique(dropna=True))
+    unique_ratio = safe_ratio(unique_count, usable_rows)
+    name_tokens = set(_tokenize_column_name(column))
+    positive_keywords = sorted(name_tokens & POSITIVE_TARGET_KEYWORDS)
+    negative_keywords = sorted(name_tokens & NEGATIVE_TARGET_KEYWORDS)
+    temporal_keywords = sorted(name_tokens & TEMPORAL_TARGET_KEYWORDS)
+    problem_type = detect_problem_type(non_null) if usable_rows else None
+    role = _classify_general_column_role(non_null if usable_rows else raw_series, column)
+    pros = []
+    cautions = []
+    blockers = []
+    score = 0.0
+    usable_feature_count = 0
+    prepared_columns = []
+    rejected_feature_columns = []
+
+    if positive_keywords:
+        pros.append(
+            "Column name suggests an outcome field"
+            + f" ({', '.join(positive_keywords[:3])})."
+        )
+        score += 2.5
+
+    if negative_keywords:
+        cautions.append(
+            "Column name looks more descriptive than outcome-focused"
+            + f" ({', '.join(negative_keywords[:3])})."
+        )
+        score -= 1.0
+
+    if temporal_keywords and not positive_keywords:
+        blockers.append(
+            "Column name looks time-based"
+            + f" ({', '.join(temporal_keywords[:3])}), which is usually better for trend analysis than prediction."
+        )
+        score -= 2.0
+
+    if usable_rows == 0:
+        blockers.append("No usable values remain after cleaning.")
+    elif usable_rows < MIN_PREDICTION_ROWS:
+        blockers.append(f"Only {usable_rows} usable rows are available for this target.")
+    elif usable_rows < 80:
+        cautions.append(f"Only {usable_rows} usable rows remain, so prediction may be unstable.")
+        score += 0.5
+    else:
+        pros.append(f"{usable_rows} usable rows remain after cleaning.")
+        score += 1.5
+
+    if missing_ratio >= 0.45:
+        blockers.append(f"Missingness is too high ({missing_ratio:.1%}).")
+    elif missing_ratio >= 0.2:
+        cautions.append(f"Missingness is noticeable ({missing_ratio:.1%}).")
+        score -= 0.5
+    else:
+        pros.append("Coverage is reasonably complete.")
+        score += 1.0
+
+    if unique_count <= 1:
+        blockers.append("Only one distinct target value remains after cleaning.")
+
+    if role == "identifier":
+        blockers.append("Looks identifier-like or nearly unique, so it is not a meaningful prediction target.")
+        score -= 4.0
+    elif role == "datetime":
+        blockers.append("Looks like a timestamp or date field, which is usually better as a trend axis or feature.")
+        score -= 2.5
+    elif role == "text":
+        blockers.append("Looks like free text or long-form text, which is better for summarization than direct prediction here.")
+        score -= 3.0
+
+    if problem_type == "classification":
+        class_count = unique_count
+        min_class_count = int(non_null.value_counts(dropna=False).min()) if usable_rows else 0
+        if class_count == 2:
+            pros.append("Binary label structure is a strong fit for classification.")
             score += 2.5
-            reasons.append("name suggests a prediction target")
+        elif 3 <= class_count <= 12:
+            pros.append(f"{class_count} classes is a practical classification range.")
+            score += 2.0
+        elif class_count <= 30 and unique_ratio <= 0.25:
+            cautions.append(f"{class_count} classes may still work, but the classification task is getting fragmented.")
+            score += 0.5
+        elif class_count > min(40, max(10, usable_rows // 3)):
+            blockers.append(f"{class_count} classes is too fragmented for a practical classification workflow here.")
+            score -= 2.0
 
-        if pd.api.types.is_object_dtype(series) or pd.api.types.is_categorical_dtype(series) or str(series.dtype) == "bool":
-            if 2 <= unique_count <= 20:
-                score += 2
-                reasons.append("good classification candidate")
-            elif unique_count > 100:
-                score -= 1.5
-                reasons.append("too many categories")
-        elif pd.api.types.is_numeric_dtype(series):
-            if is_integer_like(series) and 2 <= unique_count <= 8 and unique_ratio < 0.2:
-                score += 1.5
-                reasons.append("good classification candidate")
-            elif unique_count >= 10:
-                score += 2
-                reasons.append("good regression candidate")
-            elif unique_count <= 1:
-                score -= 2
-                reasons.append("constant or nearly constant")
+        if usable_rows and min_class_count < 3:
+            blockers.append("At least one class has fewer than 3 rows.")
+    elif problem_type == "regression":
+        if pd.api.types.is_numeric_dtype(non_null) or numeric_conversion_ratio(non_null) >= 0.95:
+            score += 1.5
+        if unique_count >= 15:
+            pros.append("Target behaves like a continuous or count-style numeric outcome.")
+            score += 1.5
+        elif unique_count < 8:
+            cautions.append("Very few distinct numeric values are present, so descriptive analysis may be just as useful.")
+            score -= 0.5
 
-        if any(keyword in lower for keyword in ["description", "title", "name", "cast", "director"]):
-            score -= 1
-            reasons.append("often better as a feature than a target")
+    if unique_ratio > 0.98 and unique_count > 50 and role not in {"numeric"}:
+        blockers.append("Values are almost entirely unique, which is not realistic for supervised prediction.")
 
-        recommendations.append(
+    needs_deep_assessment = not blockers
+    if needs_deep_assessment:
+        assessment = assess_target_for_prediction(
+            df,
+            column,
+            drop_identifier_columns=drop_identifier_columns,
+        )
+        pros.extend([reason for reason in assessment["reasons_for_prediction"] if reason not in pros])
+        cautions.extend([reason for reason in assessment["reasons_against_prediction"] if reason not in cautions])
+        blockers.extend([reason for reason in assessment["blockers"] if reason not in blockers])
+        usable_feature_count = int(assessment["usable_feature_count"])
+
+        if not blockers and usable_feature_count >= 4:
+            score += 1.5
+        elif usable_feature_count >= 2:
+            score += 0.75
+        elif usable_feature_count == 1:
+            cautions.append("Only one usable feature column remains after preparation.")
+
+        try:
+            prepared = prepare_training_frame(
+                df,
+                column,
+                drop_identifier_columns=drop_identifier_columns,
+            )
+            prepared_columns = prepared["X"].columns.tolist()[:12]
+            rejected_feature_columns = prepared["dropped_columns"][:12]
+        except Exception:
+            prepared_columns = []
+            rejected_feature_columns = []
+
+    if blockers:
+        status = "rejected"
+        recommended_use = "Insights / conclusions"
+    elif score >= 5.0:
+        status = "recommended"
+        recommended_use = problem_type or "prediction"
+    else:
+        status = "possible"
+        recommended_use = problem_type or "manual review"
+
+    summary = (
+        f"{column} is a {status} target candidate for "
+        f"{(problem_type or 'analysis').replace('_', ' ')}."
+    )
+    if status == "rejected":
+        summary = f"{column} is not a practical prediction target for this dataset."
+
+    return {
+        "column": column,
+        "status": status,
+        "score": round(score, 2),
+        "problem_type": problem_type,
+        "target_shape": _describe_target_shape(non_null, problem_type) if usable_rows else "No usable values",
+        "recommended_use": recommended_use,
+        "summary": summary,
+        "pros": pros[:5],
+        "cautions": cautions[:5],
+        "blockers": blockers[:5],
+        "usable_rows": usable_rows,
+        "missing_pct": round(missing_ratio * 100, 1),
+        "unique_count": unique_count,
+        "unique_ratio": round(unique_ratio, 3),
+        "usable_feature_count": usable_feature_count,
+        "suggested_feature_subset": prepared_columns,
+        "rejected_feature_columns": rejected_feature_columns,
+        "positive_name_signals": positive_keywords,
+        "negative_name_signals": negative_keywords,
+    }
+
+
+def recommend_dataset_workflow(
+    df,
+    drop_identifier_columns=True,
+    top_n=8,
+    extension_registry=None,
+):
+    sanitized = sanitize_dataframe(df)
+    candidates = [
+        evaluate_target_candidate(
+            sanitized,
+            column,
+            drop_identifier_columns=drop_identifier_columns,
+        )
+        for column in sanitized.columns
+    ]
+
+    candidates = sorted(
+        candidates,
+        key=lambda candidate: (
+            {"recommended": 2, "possible": 1, "rejected": 0}[candidate["status"]],
+            candidate["score"],
+            candidate["column"].lower(),
+        ),
+        reverse=True,
+    )
+    recommended_candidates = [candidate for candidate in candidates if candidate["status"] == "recommended"]
+    possible_candidates = [candidate for candidate in candidates if candidate["status"] == "possible"]
+    rejected_candidates = [candidate for candidate in candidates if candidate["status"] == "rejected"]
+    visible_candidates = (recommended_candidates + possible_candidates)[:top_n]
+    primary_candidate = visible_candidates[0] if visible_candidates else None
+    strong_primary = recommended_candidates[0] if recommended_candidates else None
+    second_candidate = visible_candidates[1] if len(visible_candidates) > 1 else None
+    multi_target_candidates = _detect_multi_target_groups(recommended_candidates + possible_candidates)
+    feature_subset_summary = _build_feature_subset_summary(sanitized)
+
+    if strong_primary is None:
+        recommended_workflow = "insights"
+        recommended_task_type = "descriptive analysis / conclusions"
+        if primary_candidate is None:
+            summary = "No strong prediction target stands out, so insight-focused analysis is the safest recommendation."
+        else:
+            recommended_task_type = primary_candidate["problem_type"] or recommended_task_type
+            summary = (
+                f"No strong prediction target stands out. '{primary_candidate['column']}' is only a tentative option, "
+                "so insight-focused analysis is still the safer default."
+            )
+    else:
+        recommended_workflow = "prediction"
+        recommended_task_type = strong_primary["problem_type"] or "prediction"
+        clear_primary = (
+            second_candidate is None
+            or strong_primary["score"] - second_candidate["score"] >= 1.25
+        )
+        if clear_primary:
+            summary = (
+                f"The dataset appears suitable for {recommended_task_type}, and "
+                f"'{strong_primary['column']}' is the strongest default target."
+            )
+        else:
+            summary = (
+                f"The dataset can support prediction, but the best target is not completely obvious. "
+                f"'{strong_primary['column']}' is the strongest current option."
+            )
+
+    if multi_target_candidates:
+        best_group = multi_target_candidates[0]
+        if recommended_workflow == "prediction":
+            summary += (
+                f" It may also support multi-target {best_group['problem_type']} across "
+                f"{', '.join(best_group['columns'][:3])}."
+            )
+
+    task_recommendations = []
+    if primary_candidate is not None:
+        task_recommendations.append(
             {
-                "column": column,
-                "score": score,
-                "reasons": ", ".join(reasons[:3]) if reasons else "general-purpose target candidate",
+                "task_type": primary_candidate["problem_type"].title() if primary_candidate["problem_type"] else "Prediction",
+                "fit": "Best fit" if primary_candidate["status"] == "recommended" else "Possible but weak",
+                "targets": primary_candidate["column"],
+                "reason": primary_candidate["summary"],
+            }
+        )
+    if len(visible_candidates) >= 2:
+        task_recommendations.append(
+            {
+                "task_type": "Multiple possible targets",
+                "fit": "Possible",
+                "targets": ", ".join([candidate["column"] for candidate in visible_candidates[:3]]),
+                "reason": "Several columns look plausible, so the user goal should guide the final target choice.",
+            }
+        )
+    if multi_target_candidates:
+        top_group = multi_target_candidates[0]
+        task_recommendations.append(
+            {
+                "task_type": "Multi-target prediction",
+                "fit": "Possible",
+                "targets": ", ".join(top_group["columns"]),
+                "reason": top_group["reason"],
             }
         )
 
-    frame = pd.DataFrame(recommendations).sort_values(["score", "column"], ascending=[False, True])
-    return frame.head(top_n).reset_index(drop=True)
+    insight_analysis = run_insight_analysis(sanitized)
+    best_analysis_path = (
+        insight_analysis["analysis_recommendations"].iloc[0].to_dict()
+        if not insight_analysis["analysis_recommendations"].empty
+        else None
+    )
+    for row in insight_analysis["analysis_recommendations"].head(4).to_dict(orient="records"):
+        task_recommendations.append(
+            {
+                "task_type": row["analysis_type"],
+                "fit": "Useful companion" if primary_candidate is not None else "Best fit",
+                "targets": "",
+                "reason": row["reason"],
+            }
+        )
+
+    workflow_result = {
+        "summary": summary,
+        "recommended_workflow": recommended_workflow,
+        "recommended_task_type": recommended_task_type,
+        "recommended_primary_target": strong_primary["column"] if strong_primary else None,
+        "recommended_target_columns": [candidate["column"] for candidate in recommended_candidates[:top_n]],
+        "candidate_targets": visible_candidates,
+        "rejected_target_candidates": rejected_candidates[:top_n],
+        "multi_target_candidates": multi_target_candidates[:5],
+        "task_recommendations": task_recommendations[:8],
+        "feature_subset_summary": feature_subset_summary,
+        "insight_analysis": insight_analysis,
+        "best_analysis_path": best_analysis_path,
+        "candidate_lookup": {candidate["column"]: candidate for candidate in candidates},
+        "clear_primary_target": bool(
+            strong_primary is not None
+            and (
+                second_candidate is None
+                or strong_primary["score"] - second_candidate["score"] >= 1.25
+            )
+        ),
+    }
+
+    workflow_result["assistant_extensions"] = _collect_assistant_extensions(
+        extension_registry,
+        sanitized,
+        artifacts={
+            "workflow": workflow_result,
+            "insight_analysis": insight_analysis,
+            "column_inspection": insight_analysis.get("column_inspection"),
+            "feature_subset_summary": feature_subset_summary,
+        },
+    )
+
+    return workflow_result
+
+
+def recommend_target_columns(df, top_n=5, extension_registry=None):
+    workflow = recommend_dataset_workflow(
+        df,
+        drop_identifier_columns=True,
+        top_n=top_n,
+        extension_registry=extension_registry,
+    )
+    rows = []
+    for candidate in workflow["candidate_targets"][:top_n]:
+        rows.append(
+            {
+                "column": candidate["column"],
+                "score": candidate["score"],
+                "workflow_fit": candidate["status"].title(),
+                "suggested_task": candidate["problem_type"] or "Insights",
+                "reasons": "; ".join((candidate["pros"] + candidate["cautions"])[:3]) or candidate["summary"],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def assess_target_for_prediction(df, target_col, drop_identifier_columns=True):
+    sanitized = sanitize_dataframe(df)
+    if target_col not in sanitized.columns:
+        raise ValueError(f"Target column '{target_col}' was not found.")
+
+    target = sanitize_target_series(sanitized[target_col])
+    non_null_target = target.dropna()
+    usable_rows = int(len(non_null_target))
+    missing_ratio = 1 - safe_ratio(usable_rows, len(sanitized))
+    unique_count = int(non_null_target.nunique(dropna=True))
+    unique_ratio = safe_ratio(unique_count, usable_rows)
+    problem_type = detect_problem_type(non_null_target) if usable_rows else None
+
+    reasons_for = []
+    reasons_against = []
+    blockers = []
+    usable_feature_count = 0
+
+    if usable_rows == 0:
+        blockers.append("The selected target has no usable values after cleaning.")
+    elif usable_rows < MIN_PREDICTION_ROWS:
+        blockers.append(
+            f"Only {usable_rows} usable target rows remain after cleaning, which is too small for a reliable model."
+        )
+    elif usable_rows < 80:
+        reasons_against.append(
+            f"Only {usable_rows} usable target rows remain, so predictive results may be unstable."
+        )
+    else:
+        reasons_for.append(f"There are {usable_rows} usable rows for supervised modeling.")
+
+    if missing_ratio >= 0.45:
+        blockers.append(
+            f"The target is {missing_ratio:.1%} missing, which is too incomplete for a practical model."
+        )
+    elif missing_ratio >= 0.2:
+        reasons_against.append(
+            f"The target is {missing_ratio:.1%} missing, which weakens training coverage."
+        )
+    else:
+        reasons_for.append("Target coverage is reasonably complete.")
+
+    if unique_count <= 1:
+        blockers.append("The target has only one distinct value after cleaning.")
+
+    if usable_rows and _is_identifier_like(non_null_target, target_col):
+        blockers.append("The target looks identifier-like or sequential rather than meaningfully predictable.")
+
+    if usable_rows and _is_text_heavy_target(non_null_target):
+        blockers.append("The target looks like long-form text, which this app should summarize rather than predict directly.")
+
+    if problem_type == "classification":
+        class_counts = non_null_target.value_counts(dropna=False)
+        min_class_count = int(class_counts.min()) if not class_counts.empty else 0
+        if len(class_counts) < 2:
+            blockers.append("Classification needs at least two target classes.")
+        elif unique_count > min(40, max(10, usable_rows // 3)):
+            blockers.append(
+                f"The target creates {unique_count} classes, which is too fragmented for a practical classification workflow here."
+            )
+        elif min_class_count < 3:
+            blockers.append("At least one target class has fewer than 3 rows.")
+        else:
+            reasons_for.append(f"Target looks like a classification problem with {unique_count} classes.")
+
+        if unique_ratio > 0.35 and unique_count > 15:
+            reasons_against.append("The target has many classes relative to dataset size, so the model may generalize poorly.")
+
+    elif problem_type == "regression":
+        if not pd.api.types.is_numeric_dtype(non_null_target) and numeric_conversion_ratio(non_null_target) < 0.95:
+            blockers.append("The target does not behave like a clean numeric outcome for regression.")
+        elif unique_count < 8:
+            reasons_against.append("The target has very few distinct values, so a descriptive summary may be more meaningful than regression.")
+        else:
+            reasons_for.append("Target behaves like a numeric outcome suited to regression.")
+
+    try:
+        prepared = prepare_training_frame(
+            sanitized,
+            target_col,
+            drop_identifier_columns=drop_identifier_columns,
+        )
+        usable_feature_count = int(prepared["X"].shape[1])
+        if usable_feature_count < 1:
+            blockers.append("No usable feature columns remain after preparation.")
+        elif usable_feature_count == 1:
+            reasons_against.append("Only one usable feature column remains after preparation.")
+        else:
+            reasons_for.append(
+                f"{usable_feature_count} usable feature columns remain after preparation."
+            )
+    except Exception as exc:
+        blockers.append(str(exc))
+
+    mode_recommendation = "analysis" if blockers else "prediction"
+    if mode_recommendation == "prediction":
+        summary = (
+            f"Prediction mode is reasonable for '{target_col}' because the target shape and dataset coverage look workable."
+        )
+    else:
+        summary = (
+            f"Insight mode is safer for '{target_col}' because the target or dataset does not support a trustworthy predictive workflow."
+        )
+
+    return {
+        "selected_target": target_col,
+        "problem_type": problem_type,
+        "mode_recommendation": mode_recommendation,
+        "summary": summary,
+        "reasons_for_prediction": reasons_for,
+        "reasons_against_prediction": reasons_against,
+        "blockers": blockers,
+        "usable_rows": usable_rows,
+        "missing_ratio": float(missing_ratio),
+        "unique_count": unique_count,
+        "unique_ratio": float(unique_ratio),
+        "usable_feature_count": usable_feature_count,
+    }
 
 
 def prepare_training_frame(df, target_col, drop_identifier_columns=True):
@@ -965,6 +1593,64 @@ def align_prediction_frame(prediction_df, feature_columns):
     return prediction_df[feature_columns].copy()
 
 
+def _build_analysis_result(
+    df,
+    insight_analysis,
+    target_col=None,
+    target_assessment=None,
+    predictive_attempt=None,
+    extra_notes=None,
+    dataset_recommendation=None,
+):
+    details = []
+    summary = "The dataset is better suited to insight-focused analysis than predictive modeling."
+
+    if target_col is None:
+        summary = "No target was selected, so the app switched to insight mode automatically."
+        details.append("A supervised model needs a clearly defined outcome column.")
+    elif target_assessment is not None:
+        summary = target_assessment["summary"]
+        details.extend(target_assessment["blockers"])
+        details.extend(target_assessment["reasons_against_prediction"])
+
+    if predictive_attempt is not None:
+        summary = (
+            f"Prediction was tested for '{target_col}', but the holdout results were too weak to present as a useful model."
+        )
+        details.append(predictive_attempt["quality"]["summary"])
+        details.append(
+            f"Best model tested: {predictive_attempt['best_model_name']}."
+        )
+
+    notes = list(extra_notes or [])
+    if target_assessment is not None:
+        notes.extend(target_assessment["reasons_for_prediction"])
+        notes.extend(target_assessment["reasons_against_prediction"])
+        notes.extend(target_assessment["blockers"])
+    if predictive_attempt is not None:
+        notes.append(predictive_attempt["quality"]["summary"])
+
+    return {
+        "mode": "analysis",
+        "dataset_recommendation": dataset_recommendation,
+        "decision": {
+            "selected_mode": "analysis",
+            "summary": summary,
+            "details": details[:6],
+        },
+        "target_assessment": target_assessment,
+        "predictive_attempt": predictive_attempt,
+        "insight_analysis": insight_analysis,
+        "analysis_recommendations": insight_analysis["analysis_recommendations"],
+        "notes": notes,
+        "used_rows": int(df.shape[0]),
+        "original_rows": int(df.shape[0]),
+        "original_columns": int(df.shape[1]),
+        "missing_cells": int(df.isna().sum().sum()),
+        "selected_target": target_col,
+    }
+
+
 def run_analysis(
     df,
     target_col,
@@ -972,8 +1658,100 @@ def run_analysis(
     test_size=0.2,
     drop_identifier_columns=True,
     training_effort="standard",
+    extension_registry=None,
 ):
-    prepared = prepare_training_frame(df, target_col, drop_identifier_columns=drop_identifier_columns)
+    sanitized_df = sanitize_dataframe(df)
+    selected_target = target_col if target_col in sanitized_df.columns else None
+    dataset_recommendation = recommend_dataset_workflow(
+        sanitized_df,
+        drop_identifier_columns=drop_identifier_columns,
+        top_n=min(8, len(sanitized_df.columns)),
+        extension_registry=extension_registry,
+    )
+    insight_analysis = dataset_recommendation["insight_analysis"]
+    insight_analysis["selected_target"] = selected_target
+
+    if not selected_target:
+        result = _build_analysis_result(
+            sanitized_df,
+            insight_analysis,
+            target_col=None,
+            extra_notes=["No target selected. Defaulted to descriptive dataset analysis."],
+            dataset_recommendation=dataset_recommendation,
+        )
+        result["assistant_extensions"] = _collect_assistant_extensions(
+            extension_registry,
+            sanitized_df,
+            artifacts={
+                "workflow": dataset_recommendation,
+                "insight_analysis": insight_analysis,
+                "column_inspection": insight_analysis.get("column_inspection"),
+                "feature_subset_summary": dataset_recommendation.get("feature_subset_summary"),
+                "result": result,
+            },
+        )
+        return result
+
+    target_candidate = dataset_recommendation["candidate_lookup"].get(selected_target)
+    if target_candidate is not None and target_candidate["status"] != "rejected":
+        target_assessment = assess_target_for_prediction(
+            sanitized_df,
+            selected_target,
+            drop_identifier_columns=drop_identifier_columns,
+        )
+    elif target_candidate is not None:
+        target_assessment = {
+            "selected_target": selected_target,
+            "problem_type": target_candidate["problem_type"],
+            "mode_recommendation": "analysis",
+            "summary": (
+                f"Insight mode is safer for '{selected_target}' because it was rejected as a practical prediction target."
+            ),
+            "reasons_for_prediction": target_candidate["pros"],
+            "reasons_against_prediction": target_candidate["cautions"],
+            "blockers": target_candidate["blockers"],
+            "usable_rows": target_candidate["usable_rows"],
+            "missing_ratio": float(target_candidate["missing_pct"]) / 100.0,
+            "unique_count": target_candidate["unique_count"],
+            "unique_ratio": float(target_candidate["unique_ratio"]),
+            "usable_feature_count": target_candidate["usable_feature_count"],
+        }
+    else:
+        target_assessment = assess_target_for_prediction(
+            sanitized_df,
+            selected_target,
+            drop_identifier_columns=drop_identifier_columns,
+        )
+
+    if target_assessment["mode_recommendation"] != "prediction":
+        result = _build_analysis_result(
+            sanitized_df,
+            insight_analysis,
+            target_col=selected_target,
+            target_assessment=target_assessment,
+            dataset_recommendation=dataset_recommendation,
+        )
+        result["assistant_extensions"] = _collect_assistant_extensions(
+            extension_registry,
+            sanitized_df,
+            target_col=selected_target,
+            artifacts={
+                "workflow": dataset_recommendation,
+                "insight_analysis": insight_analysis,
+                "column_inspection": insight_analysis.get("column_inspection"),
+                "feature_subset_summary": dataset_recommendation.get("feature_subset_summary"),
+                "target_candidate": target_candidate,
+                "target_assessment": target_assessment,
+                "result": result,
+            },
+        )
+        return result
+
+    prepared = prepare_training_frame(
+        sanitized_df,
+        selected_target,
+        drop_identifier_columns=drop_identifier_columns,
+    )
     X = prepared["X"]
     y = prepared["y"]
 
@@ -1017,6 +1795,8 @@ def run_analysis(
             0,
             f"Detected an imbalanced classification target (minority class share {trained['imbalance_ratio']:.3%}); ranking models by average precision.",
         )
+    notes.extend(target_assessment["reasons_for_prediction"])
+    notes.extend(target_assessment["reasons_against_prediction"])
 
     prediction_preview = trained["X_test"].copy().reset_index(drop=True)
     prediction_preview["actual"] = pd.Series(trained["y_test"]).reset_index(drop=True)
@@ -1033,7 +1813,57 @@ def run_analysis(
         feature_importance,
     )
 
-    return {
+    if quality["verdict"] == "weak":
+        result = _build_analysis_result(
+            sanitized_df,
+            insight_analysis,
+            target_col=selected_target,
+            target_assessment=target_assessment,
+            predictive_attempt={
+                "problem_type": problem_type,
+                "best_model_name": trained["best_model_name"],
+                "best_metrics": trained["best_metrics"],
+                "baseline_metrics": baseline_metrics,
+                "quality": quality,
+            },
+            extra_notes=notes,
+            dataset_recommendation=dataset_recommendation,
+        )
+        result["assistant_extensions"] = _collect_assistant_extensions(
+            extension_registry,
+            sanitized_df,
+            target_col=selected_target,
+            artifacts={
+                "workflow": dataset_recommendation,
+                "insight_analysis": insight_analysis,
+                "column_inspection": insight_analysis.get("column_inspection"),
+                "feature_subset_summary": dataset_recommendation.get("feature_subset_summary"),
+                "target_candidate": target_candidate,
+                "target_assessment": target_assessment,
+                "prepared_frame": prepared,
+                "result": result,
+            },
+        )
+        return result
+
+    result = {
+        "mode": "prediction",
+        "dataset_recommendation": dataset_recommendation,
+        "decision": {
+            "selected_mode": "prediction",
+            "summary": (
+                f"Prediction mode stayed active for '{selected_target}' because the target looked workable "
+                f"and the best holdout model was rated {quality['verdict']}."
+            ),
+            "details": (
+                target_assessment["reasons_for_prediction"]
+                + target_assessment["reasons_against_prediction"]
+                + [quality["summary"]]
+            )[:6],
+        },
+        "target_assessment": target_assessment,
+        "analysis_recommendations": insight_analysis["analysis_recommendations"],
+        "insight_analysis": insight_analysis,
         "problem_type": problem_type,
         "target_style": target_style,
         "results": trained["results"],
@@ -1051,9 +1881,26 @@ def run_analysis(
         "training_effort": training_effort,
         "used_rows": int(len(sampled_X)),
         "original_rows": int(len(X)),
-        "original_columns": int(df.shape[1]),
-        "missing_cells": int(df.isna().sum().sum()),
+        "original_columns": int(sanitized_df.shape[1]),
+        "missing_cells": int(sanitized_df.isna().sum().sum()),
         "target_series": y.reset_index(drop=True),
         "holdout_actual": trained["y_test"].reset_index(drop=True),
         "holdout_pred": pd.Series(trained["preds"]).reset_index(drop=True),
+        "selected_target": selected_target,
     }
+    result["assistant_extensions"] = _collect_assistant_extensions(
+        extension_registry,
+        sanitized_df,
+        target_col=selected_target,
+        artifacts={
+            "workflow": dataset_recommendation,
+            "insight_analysis": insight_analysis,
+            "column_inspection": insight_analysis.get("column_inspection"),
+            "feature_subset_summary": dataset_recommendation.get("feature_subset_summary"),
+            "target_candidate": target_candidate,
+            "target_assessment": target_assessment,
+            "prepared_frame": prepared,
+            "result": result,
+        },
+    )
+    return result
