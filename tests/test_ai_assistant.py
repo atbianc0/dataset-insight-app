@@ -2,8 +2,8 @@ import json
 
 import pandas as pd
 
-from src.ai_assistant import build_runtime_extension_registry
 from src import pipeline
+from src.ai_assistant import build_runtime_extension_registry
 
 
 def make_prediction_ready_frame(rows=120):
@@ -87,6 +87,9 @@ def test_ai_assistant_adds_advisory_workflow_context_without_replacing_heuristic
     assert task_payload["ai_target_suggestions"][0]["column"] == "churn_status"
     assert fake_client.responses.calls
     assert len(fake_client.responses.calls) == 1
+    request_text = fake_client.responses.calls[0]["input"]
+    assert "sample_values" not in request_text
+    assert "C0000" not in request_text
 
 
 def test_ai_assistant_outputs_are_available_in_final_analysis_report_context():

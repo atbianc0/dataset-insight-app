@@ -4,7 +4,6 @@ import warnings
 import numpy as np
 import pandas as pd
 
-
 COMMON_MISSING_TOKENS = {
     "",
     " ",
@@ -60,7 +59,7 @@ def is_datetime_candidate(series):
     if pd.api.types.is_numeric_dtype(series):
         return False
 
-    sample = pd.Series(series).dropna().astype(str).head(150)
+    sample = pd.Series(series).dropna().head(150).astype(str)
     if sample.empty:
         return False
 
@@ -76,8 +75,32 @@ def is_identifier_like(series, name):
         return False
 
     unique_ratio = safe_ratio(non_null.nunique(), len(non_null))
-    lower_name = str(name).lower()
-    if "id" in lower_name and unique_ratio > 0.75:
+    lower_name = str(name).strip().lower()
+    compact_name = re.sub(r"[^a-z0-9]", "", lower_name)
+    name_tokens = set(tokenize_column_name(name))
+    compact_entity_names = {
+        "account",
+        "customer",
+        "employee",
+        "event",
+        "order",
+        "product",
+        "record",
+        "row",
+        "session",
+        "show",
+        "transaction",
+        "user",
+    }
+    identifier_name = (
+        lower_name == "id"
+        or lower_name.startswith("id_")
+        or lower_name.endswith("_id")
+        or (compact_name.startswith("id") and compact_name[2:] in compact_entity_names)
+        or (compact_name.endswith("id") and compact_name[:-2] in compact_entity_names)
+        or bool(name_tokens & {"id", "uuid", "guid", "identifier"})
+    )
+    if identifier_name and unique_ratio > 0.75:
         return True
 
     if pd.api.types.is_numeric_dtype(non_null):
@@ -95,7 +118,7 @@ def word_count(series):
 
 
 def is_text_heavy(series):
-    sample = pd.Series(series).dropna().astype(str).head(200)
+    sample = pd.Series(series).dropna().head(200).astype(str)
     if sample.empty:
         return False
 
@@ -116,10 +139,10 @@ def classify_general_column_role(series, column_name):
         return "datetime"
     if is_text_heavy(series):
         return "text"
-    if pd.api.types.is_numeric_dtype(series):
-        return "numeric"
     if pd.api.types.is_bool_dtype(series):
         return "boolean"
+    if pd.api.types.is_numeric_dtype(series):
+        return "numeric"
 
     unique_count = int(pd.Series(series).nunique(dropna=True))
     if 2 <= unique_count <= 20:
@@ -128,5 +151,20 @@ def classify_general_column_role(series, column_name):
 
 
 def sample_values(series, max_values=3):
-    values = pd.Series(series).dropna().astype(str).unique().tolist()[:max_values]
-    return ", ".join(values) if values else ""
+    if max_values <= 0:
+        return ""
+
+    values = []
+    seen = set()
+    for value in pd.Series(series).array:
+        missing = pd.isna(value)
+        if isinstance(missing, (bool, np.bool_)) and missing:
+            continue
+        rendered = str(value)
+        if rendered in seen:
+            continue
+        seen.add(rendered)
+        values.append(rendered)
+        if len(values) >= max_values:
+            break
+    return ", ".join(values)

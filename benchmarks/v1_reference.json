@@ -1,0 +1,65 @@
+{
+  "benchmark_version": "1.0",
+  "recorded_at": "2026-08-07",
+  "machine": {
+    "model": "Apple M1",
+    "memory_gib": 16,
+    "operating_system": "macOS 26.5.1",
+    "python": "3.11.5"
+  },
+  "configuration": {
+    "effort": "standard",
+    "cross_validation_folds": 3,
+    "model_sample_rows": 60000,
+    "external_validation_rows": 64374,
+    "random_seed": 42,
+    "holdout_fraction": 0.2
+  },
+  "fixtures": {
+    "netflix_titles.csv": "df1f4ad2027a5a14c3a33932ef0d4054565ff88adf92b7f263601b70fdc6f3f3",
+    "customer_churn_dataset-training-master.csv": "a41be7b96fb85110521bf03d1530879e9ca94b9f5de19866757f6d184300fff7",
+    "customer_churn_dataset-testing-master.csv": "330af932f2dc1cae917f3bd0fb29395c4021319dd906189b7dc257d0ad58a617"
+  },
+  "results": {
+    "profile_seconds": {
+      "netflix": 0.213,
+      "churn_testing": 0.354,
+      "churn_training": 2.369
+    },
+    "standard_training_seconds": 10.535,
+    "external_scoring_seconds": 0.8,
+    "standard_training_and_external_evaluation_seconds": 11.335,
+    "workflow_peak_resident_bytes": 1154793472,
+    "workflow_peak_resident_gib": 1.076,
+    "external_rows_scored": 64374,
+    "overlapping_identifiers": 62995,
+    "internal_average_precision": 0.999999,
+    "external_average_precision": 0.618244,
+    "external_roc_auc": 0.7234,
+    "external_balanced_accuracy": 0.5283,
+    "external_baseline_average_precision": 0.473685,
+    "readiness": "not deployment-ready"
+  },
+  "verification": {
+    "full_suite_runs": [
+      {
+        "tests_passed": 72,
+        "pytest_seconds": 63.83,
+        "maximum_resident_bytes": 1517764608
+      },
+      {
+        "tests_passed": 72,
+        "pytest_seconds": 63.78,
+        "maximum_resident_bytes": 1495203840
+      }
+    ],
+    "note": "Full-suite memory retains several independent AppTest sessions; the peak-memory release target applies to the single end-to-end application workflow above."
+  },
+  "targets": {
+    "netflix_profile_seconds": 3,
+    "churn_testing_profile_seconds": 8,
+    "churn_training_profile_seconds": 20,
+    "standard_training_and_external_evaluation_seconds": 60,
+    "peak_memory_bytes": 1500000000
+  }
+}

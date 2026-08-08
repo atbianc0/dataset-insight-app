@@ -1,6 +1,5 @@
 import json
 import os
-from typing import Any, Dict, List, Optional
 
 from src.extensions import (
     HeuristicPipelineExtension,
@@ -64,7 +63,7 @@ class OpenAIDatasetInterpretationAssistant(PipelineExtension):
             payload={
                 "ai_semantic_column_notes": semantic_notes,
             },
-            summary="AI-assisted semantic notes were generated from column names and sampled values.",
+            summary="AI-assisted semantic notes were generated from aggregate schema metadata.",
         )
 
     def task_understanding(self, context):
@@ -118,7 +117,6 @@ class OpenAIDatasetInterpretationAssistant(PipelineExtension):
                         "coverage_pct": row.get("coverage_pct"),
                         "missing_pct": row.get("missing_pct"),
                         "unique_values": row.get("unique_values"),
-                        "sample_values": row.get("sample_values"),
                         "heuristic_recommendation": row.get("recommendation"),
                     }
                 )
@@ -265,6 +263,7 @@ class OpenAIDatasetInterpretationAssistant(PipelineExtension):
             instructions=instructions,
             input=prompt,
             max_output_tokens=1200,
+            timeout=30,
             text={"format": {"type": "json_schema", **schema}},
         )
         content = getattr(response, "output_text", None)

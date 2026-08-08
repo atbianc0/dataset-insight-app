@@ -1,4 +1,7 @@
+from pathlib import Path
+
 import pandas as pd
+import pytest
 
 from src import pipeline
 
@@ -74,6 +77,23 @@ def test_dataset_workflow_prefers_insights_without_strong_target():
     assert "insight-focused analysis" in workflow["summary"].lower()
 
 
+def test_netflix_type_is_modelable_but_never_auto_selected_as_an_outcome():
+    fixture = Path(__file__).resolve().parents[1] / "sample_data/netflix_titles.csv"
+
+    workflow = pipeline.recommend_dataset_workflow(pd.read_csv(fixture))
+
+    assert workflow["recommended_workflow"] == "insights"
+    assert workflow["recommended_primary_target"] is None
+    assert "type" in workflow["candidate_lookup"]
+
+
+def test_pipeline_sanitizer_rejects_normalized_duplicate_headers():
+    frame = pd.DataFrame([[1, 2]], columns=["value", " value "])
+
+    with pytest.raises(ValueError, match="unique after trimming"):
+        pipeline.sanitize_dataframe(frame)
+
+
 def test_multi_target_grouping_surfaces_related_targets():
     df = pd.DataFrame(
         {
@@ -118,6 +138,8 @@ def test_run_analysis_falls_back_to_insights_when_model_quality_is_weak(monkeypa
             "best_model_name": "Dummy Model",
             "best_model": DummyBestModel(),
             "best_metrics": {"accuracy": 0.5, "precision": 0.25, "recall": 0.5, "f1": 0.333},
+            "baseline_metrics": {"f1": 0.333},
+            "feature_importance": pd.DataFrame(columns=["feature", "importance"]),
             "metric_name": "f1",
             "X_test": X.head(4).reset_index(drop=True),
             "y_test": y_test,
@@ -128,11 +150,6 @@ def test_run_analysis_falls_back_to_insights_when_model_quality_is_weak(monkeypa
         }
 
     monkeypatch.setattr(pipeline, "train_best_model", fake_train_best_model)
-    monkeypatch.setattr(
-        pipeline,
-        "build_feature_importance",
-        lambda best_model, feature_names: pd.DataFrame(columns=["feature", "importance"]),
-    )
     monkeypatch.setattr(
         pipeline,
         "build_chart_context",

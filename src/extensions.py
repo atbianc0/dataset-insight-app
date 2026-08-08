@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence
-
+from typing import Any, Dict, Iterable, Optional, Sequence
 
 EXTENSION_STAGES = (
     "semantic_column_interpretation",

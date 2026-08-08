@@ -5,7 +5,9 @@ __pycache__/
 models/*.pkl
 outputs/*.csv
 sample_data/creditcard.csv
-sample_data/creditcard.csv
-sample_data/creditcard.csv
-
-sample_data/creditcard.csv
+.env
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+coverage.xml

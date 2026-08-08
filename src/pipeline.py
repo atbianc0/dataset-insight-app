@@ -1,54 +1,39 @@
 import os
-import warnings
 
 os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 
 import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
-from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.metrics import (
-    accuracy_score,
-    average_precision_score,
-    balanced_accuracy_score,
-    confusion_matrix,
-    f1_score,
-    mean_absolute_error,
-    mean_squared_error,
-    precision_score,
-    precision_recall_curve,
-    r2_score,
-    recall_score,
-    roc_auc_score,
-)
+from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
 
-from src.extensions import AnalysisContext, DEFAULT_EXTENSION_REGISTRY
+from src.contracts import AnalysisConfig, DatasetProfile
+from src.extensions import DEFAULT_EXTENSION_REGISTRY, AnalysisContext
 from src.heuristics import (
     classify_general_column_role as _classify_general_column_role,
-    is_datetime_candidate as _is_datetime_candidate,
+)
+from src.heuristics import (
     is_identifier_like as _is_identifier_like,
+)
+from src.heuristics import (
     is_integer_like,
-    is_text_heavy as _is_text_heavy_target,
     normalize_missing_tokens,
     numeric_conversion_ratio,
     safe_ratio,
+)
+from src.heuristics import (
+    is_text_heavy as _is_text_heavy_target,
+)
+from src.heuristics import (
     tokenize_column_name as _tokenize_column_name,
-    word_count as _word_count,
 )
 from src.insights import run_insight_analysis
-
+from src.modeling import train_model
 
 MAX_PREVIEW_ROWS = 25
 MAX_CHART_ROWS = 5000
 BENCHMARK_ROWS = 20000
-MAX_TRAIN_ROWS = 60000
+MAX_TRAIN_ROWS = int(os.getenv("DATALENS_MODEL_SAMPLE_ROWS", "60000"))
 HIGH_CARDINALITY_LIMIT = 80
 MIN_PREDICTION_ROWS = 30
 POSITIVE_TARGET_KEYWORDS = {
@@ -80,8 +65,19 @@ POSITIVE_TARGET_KEYWORDS = {
     "success",
     "survived",
     "target",
-    "type",
     "value",
+}
+HIGH_CONFIDENCE_AUTO_TARGET_KEYWORDS = {
+    "attrition",
+    "churn",
+    "converted",
+    "conversion",
+    "default",
+    "fraud",
+    "label",
+    "outcome",
+    "response",
+    "target",
 }
 NEGATIVE_TARGET_KEYWORDS = {
     "address",
@@ -149,7 +145,14 @@ def _collect_assistant_extensions(
 def sanitize_dataframe(df):
     cleaned = df.copy()
     cleaned.columns = [str(column).strip() for column in cleaned.columns]
-    cleaned = cleaned.loc[:, ~pd.Index(cleaned.columns).duplicated()].copy()
+    duplicates = (
+        pd.Index(cleaned.columns)[pd.Index(cleaned.columns).duplicated()].unique().tolist()
+    )
+    if duplicates:
+        raise ValueError(
+            "Column names must be unique after trimming whitespace. Duplicate columns: "
+            + ", ".join(duplicates[:5])
+        )
     cleaned = cleaned.replace([np.inf, -np.inf], np.nan)
 
     for column in cleaned.columns:
@@ -177,15 +180,6 @@ def sanitize_target_series(series):
     return target
 
 
-def assert_no_missing_target(y, label):
-    missing_count = int(pd.Series(y).isna().sum())
-    if missing_count:
-        raise ValueError(
-            f"The target column still contains {missing_count} missing values after cleaning ({label}). "
-            "Please remove or correct blank/invalid target values."
-        )
-
-
 def filter_valid_target_rows(X, y, label, min_rows=20):
     cleaned_y = sanitize_target_series(pd.Series(y))
     valid_mask = ~cleaned_y.isna()
@@ -208,7 +202,12 @@ def filter_valid_target_rows(X, y, label, min_rows=20):
 
 
 def detect_problem_type(y):
-    if str(y.dtype) in ["object", "category", "bool"]:
+    if (
+        pd.api.types.is_object_dtype(y)
+        or pd.api.types.is_string_dtype(y)
+        or isinstance(y.dtype, pd.CategoricalDtype)
+        or pd.api.types.is_bool_dtype(y)
+    ):
         if numeric_conversion_ratio(y) >= 0.95:
             y = pd.to_numeric(y, errors="coerce")
         else:
@@ -224,6 +223,19 @@ def detect_problem_type(y):
     return "regression"
 
 
+def _categorical_column_names(frame):
+    return [
+        column
+        for column in frame.columns
+        if (
+            pd.api.types.is_object_dtype(frame[column])
+            or pd.api.types.is_string_dtype(frame[column])
+            or isinstance(frame[column].dtype, pd.CategoricalDtype)
+            or pd.api.types.is_bool_dtype(frame[column])
+        )
+    ]
+
+
 def summarize_target_style(y, problem_type):
     unique_count = int(y.nunique(dropna=False))
     if problem_type == "classification":
@@ -233,48 +245,6 @@ def summarize_target_style(y, problem_type):
     else:
         label = "numeric regression"
     return {"label": label, "unique_count": unique_count}
-
-
-def is_count_regression_target(y, problem_type):
-    return (
-        problem_type == "regression"
-        and is_integer_like(y)
-        and y.min() >= 0
-    )
-
-
-def _expand_datetime_column(series, name):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        parsed = pd.to_datetime(series, errors="coerce")
-    return pd.DataFrame(
-        {
-            f"{name}__year": parsed.dt.year,
-            f"{name}__month": parsed.dt.month,
-            f"{name}__day": parsed.dt.day,
-            f"{name}__dayofweek": parsed.dt.dayofweek,
-        }
-    )
-
-
-def _split_multi_value_text(series):
-    cleaned = series.fillna("").astype(str)
-    tokenized = cleaned.str.split(",")
-    first_item = tokenized.str[0].str.strip().replace("", np.nan)
-    item_count = tokenized.apply(
-        lambda values: sum(1 for value in values if str(value).strip()) if isinstance(values, list) else 0
-    )
-    return first_item, item_count
-
-
-def _extract_numeric_text_parts(series):
-    cleaned = series.fillna("").astype(str).str.strip()
-    numeric_text = cleaned.where(
-        cleaned.str.match(r"^\s*[-+]?\d*\.?\d+\s*[A-Za-z]+\s*$", na=False)
-    )
-    numbers = pd.to_numeric(numeric_text.str.extract(r"([-+]?\d*\.?\d+)")[0], errors="coerce")
-    units = numeric_text.str.extract(r"[-+]?\d*\.?\d+\s*([A-Za-z]+)")[0]
-    return numbers, units
 
 
 def _describe_target_shape(series, problem_type):
@@ -461,7 +431,37 @@ def _detect_multi_target_groups(candidates):
     return frame.to_dict(orient="records")
 
 
-def evaluate_target_candidate(df, column, drop_identifier_columns=True):
+def _build_training_column_metadata(df):
+    """Profile modeling suitability once instead of once per possible target."""
+
+    metadata = {}
+    for column in df.columns:
+        series = df[column]
+        unique_count = int(series.nunique(dropna=True))
+        if series.isna().all():
+            status, reason = "drop", "all values missing"
+        elif unique_count <= 1:
+            status, reason = "drop", "constant values"
+        elif _is_identifier_like(series, column):
+            status, reason = "drop", "identifier-like"
+        elif _is_text_heavy_target(series):
+            status, reason = "derived", "long text converted to a length feature"
+        else:
+            status, reason = "usable", "supported raw feature"
+        metadata[column] = {
+            "status": status,
+            "reason": reason,
+            "role": _classify_general_column_role(series, column),
+        }
+    return metadata
+
+
+def evaluate_target_candidate(
+    df,
+    column,
+    drop_identifier_columns=True,
+    column_metadata=None,
+):
     if column not in df.columns:
         raise ValueError(f"Target column '{column}' was not found.")
 
@@ -573,10 +573,14 @@ def evaluate_target_candidate(df, column, drop_identifier_columns=True):
 
     needs_deep_assessment = not blockers
     if needs_deep_assessment:
+        metadata = column_metadata or _build_training_column_metadata(df)
         assessment = assess_target_for_prediction(
             df,
             column,
             drop_identifier_columns=drop_identifier_columns,
+            column_metadata=metadata,
+            prepare_features=False,
+            already_sanitized=True,
         )
         pros.extend([reason for reason in assessment["reasons_for_prediction"] if reason not in pros])
         cautions.extend([reason for reason in assessment["reasons_against_prediction"] if reason not in cautions])
@@ -590,17 +594,16 @@ def evaluate_target_candidate(df, column, drop_identifier_columns=True):
         elif usable_feature_count == 1:
             cautions.append("Only one usable feature column remains after preparation.")
 
-        try:
-            prepared = prepare_training_frame(
-                df,
-                column,
-                drop_identifier_columns=drop_identifier_columns,
-            )
-            prepared_columns = prepared["X"].columns.tolist()[:12]
-            rejected_feature_columns = prepared["dropped_columns"][:12]
-        except Exception:
-            prepared_columns = []
-            rejected_feature_columns = []
+        prepared_columns = [
+            name
+            for name, payload in metadata.items()
+            if name != column and payload["status"] != "drop"
+        ][:12]
+        rejected_feature_columns = [
+            name
+            for name, payload in metadata.items()
+            if name != column and payload["status"] == "drop"
+        ][:12]
 
     if blockers:
         status = "rejected"
@@ -649,11 +652,13 @@ def recommend_dataset_workflow(
     extension_registry=None,
 ):
     sanitized = sanitize_dataframe(df)
+    column_metadata = _build_training_column_metadata(sanitized)
     candidates = [
         evaluate_target_candidate(
             sanitized,
             column,
             drop_identifier_columns=drop_identifier_columns,
+            column_metadata=column_metadata,
         )
         for column in sanitized.columns
     ]
@@ -672,7 +677,15 @@ def recommend_dataset_workflow(
     rejected_candidates = [candidate for candidate in candidates if candidate["status"] == "rejected"]
     visible_candidates = (recommended_candidates + possible_candidates)[:top_n]
     primary_candidate = visible_candidates[0] if visible_candidates else None
-    strong_primary = recommended_candidates[0] if recommended_candidates else None
+    credible_recommended_candidates = [
+        candidate
+        for candidate in recommended_candidates
+        if set(candidate.get("positive_name_signals", []))
+        & HIGH_CONFIDENCE_AUTO_TARGET_KEYWORDS
+    ]
+    strong_primary = (
+        credible_recommended_candidates[0] if credible_recommended_candidates else None
+    )
     second_candidate = visible_candidates[1] if len(visible_candidates) > 1 else None
     multi_target_candidates = _detect_multi_target_groups(recommended_candidates + possible_candidates)
     feature_subset_summary = _build_feature_subset_summary(sanitized)
@@ -818,8 +831,15 @@ def recommend_target_columns(df, top_n=5, extension_registry=None):
     return pd.DataFrame(rows)
 
 
-def assess_target_for_prediction(df, target_col, drop_identifier_columns=True):
-    sanitized = sanitize_dataframe(df)
+def assess_target_for_prediction(
+    df,
+    target_col,
+    drop_identifier_columns=True,
+    column_metadata=None,
+    prepare_features=True,
+    already_sanitized=False,
+):
+    sanitized = df if already_sanitized else sanitize_dataframe(df)
     if target_col not in sanitized.columns:
         raise ValueError(f"Target column '{target_col}' was not found.")
 
@@ -895,12 +915,20 @@ def assess_target_for_prediction(df, target_col, drop_identifier_columns=True):
             reasons_for.append("Target behaves like a numeric outcome suited to regression.")
 
     try:
-        prepared = prepare_training_frame(
-            sanitized,
-            target_col,
-            drop_identifier_columns=drop_identifier_columns,
-        )
-        usable_feature_count = int(prepared["X"].shape[1])
+        if prepare_features:
+            prepared = prepare_training_frame(
+                sanitized,
+                target_col,
+                drop_identifier_columns=drop_identifier_columns,
+            )
+            usable_feature_count = int(prepared["X"].shape[1])
+        else:
+            metadata = column_metadata or _build_training_column_metadata(sanitized)
+            usable_feature_count = sum(
+                payload["status"] != "drop"
+                for column, payload in metadata.items()
+                if column != target_col
+            )
         if usable_feature_count < 1:
             blockers.append("No usable feature columns remain after preparation.")
         elif usable_feature_count == 1:
@@ -939,6 +967,14 @@ def assess_target_for_prediction(df, target_col, drop_identifier_columns=True):
 
 
 def prepare_training_frame(df, target_col, drop_identifier_columns=True):
+    """Return cleaned *raw* features; fitted pipelines perform all feature learning.
+
+    The ``drop_identifier_columns`` argument remains for API compatibility.  ID
+    detection and exclusion now occur inside each fitted CV pipeline, so the raw
+    columns remain available for later scoring and row preservation.
+    """
+
+    del drop_identifier_columns
     sanitized = sanitize_dataframe(df)
 
     if target_col not in sanitized.columns:
@@ -960,95 +996,17 @@ def prepare_training_frame(df, target_col, drop_identifier_columns=True):
         cleaned = cleaned.loc[y.index].copy()
 
     notes = []
-    dropped_columns = []
     removed_target_rows = initial_row_count - len(cleaned)
     if removed_target_rows:
         notes.append(
             f"Removed {removed_target_rows} rows with missing or invalid target values in {target_col}."
         )
 
-    for column in list(X.columns):
-        series = X[column]
-        if series.isna().all():
-            X = X.drop(columns=[column])
-            dropped_columns.append(column)
-            notes.append(f"Dropped {column}: all values missing.")
-            continue
-
-        if series.nunique(dropna=True) <= 1:
-            X = X.drop(columns=[column])
-            dropped_columns.append(column)
-            notes.append(f"Dropped {column}: constant values.")
-            continue
-
-        if drop_identifier_columns and _is_identifier_like(series, column):
-            X = X.drop(columns=[column])
-            dropped_columns.append(column)
-            notes.append(f"Dropped {column}: identifier-like.")
-            continue
-
-        if _is_datetime_candidate(series):
-            expanded = _expand_datetime_column(series, column)
-            X = X.drop(columns=[column])
-            X = pd.concat([X, expanded], axis=1)
-            notes.append(f"Expanded {column} into datetime features.")
-            continue
-
-        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
-            cleaned = series.fillna("").astype(str)
-
-            if cleaned.str.contains(",").mean() >= 0.25:
-                first_item, item_count = _split_multi_value_text(series)
-                X[f"{column}__item_count"] = item_count
-                if first_item.nunique(dropna=True) <= HIGH_CARDINALITY_LIMIT:
-                    X[f"{column}__first_item"] = first_item
-                else:
-                    X[f"{column}__first_item_frequency"] = first_item.map(
-                        first_item.value_counts(dropna=False, normalize=True)
-                    )
-                X = X.drop(columns=[column])
-                notes.append(f"Expanded multi-value text column {column}.")
-                continue
-
-            numbers, units = _extract_numeric_text_parts(series)
-            if numbers.notna().mean() >= 0.8:
-                X[f"{column}__number"] = numbers
-                if units.nunique(dropna=True) and units.nunique(dropna=True) <= HIGH_CARDINALITY_LIMIT:
-                    X[f"{column}__unit"] = units
-                X = X.drop(columns=[column])
-                notes.append(f"Extracted numeric text features from {column}.")
-                continue
-
-            if _word_count(series).mean() >= 4:
-                X[f"{column}__word_count"] = _word_count(series)
-                X = X.drop(columns=[column])
-                notes.append(f"Converted long text column {column} into a length feature.")
-                continue
-
-            cardinality = int(series.nunique(dropna=True))
-            if cardinality > HIGH_CARDINALITY_LIMIT:
-                frequency = series.map(series.value_counts(dropna=False, normalize=True))
-                encoded_name = f"{column}__frequency"
-                X[encoded_name] = frequency.fillna(0.0)
-                X = X.drop(columns=[column])
-                notes.append(
-                    f"Encoded {column} as frequency feature because cardinality was {cardinality}."
-                )
-
-    X = X.replace([np.inf, -np.inf], np.nan)
-    empty_after_processing = [column for column in X.columns if X[column].isna().all()]
-    if empty_after_processing:
-        X = X.drop(columns=empty_after_processing)
-        dropped_columns.extend(empty_after_processing)
-        notes.extend(
-            [f"Dropped {column}: empty after cleaning or feature extraction." for column in empty_after_processing]
-        )
-
     if X.empty:
-        raise ValueError("No usable feature columns remained after preparation.")
+        raise ValueError("The dataset needs at least one feature column besides the target.")
 
     numeric_cols = X.select_dtypes(include=["number", "bool"]).columns.tolist()
-    categorical_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
+    categorical_cols = _categorical_column_names(X)
     if not numeric_cols and not categorical_cols:
         raise ValueError("No supported numeric or categorical features were found.")
 
@@ -1056,7 +1014,7 @@ def prepare_training_frame(df, target_col, drop_identifier_columns=True):
         "X": X,
         "y": y,
         "notes": notes,
-        "dropped_columns": dropped_columns,
+        "dropped_columns": [],
         "numeric_cols": numeric_cols,
         "categorical_cols": categorical_cols,
     }
@@ -1067,240 +1025,38 @@ def sample_training_data(X, y, problem_type, max_rows=MAX_TRAIN_ROWS, random_sta
         return X, y, False
 
     if problem_type == "classification":
-        combined = pd.concat([X, y.rename("__target__")], axis=1)
-        base = combined.groupby("__target__", group_keys=False).apply(
-            lambda frame: frame.sample(n=1, random_state=random_state)
+        class_counts = pd.Series(y).value_counts(dropna=False)
+        can_stratify = (
+            len(class_counts) > 1
+            and int(class_counts.min()) >= 2
+            and max_rows >= len(class_counts)
         )
-        remaining = max_rows - len(base)
-        if remaining <= 0:
-            sampled = base
-        else:
-            rest = combined.drop(index=base.index)
-            stratify = rest["__target__"] if rest["__target__"].nunique() > 1 else None
-            sampled_rest = rest.sample(
-                n=min(remaining, len(rest)),
+        if can_stratify:
+            sampled_X, _, sampled_y, _ = train_test_split(
+                X,
+                y,
+                train_size=max_rows,
                 random_state=random_state,
-            ) if stratify is None else train_test_split(
-                rest,
-                train_size=min(remaining, len(rest)),
-                random_state=random_state,
-                stratify=stratify,
-            )[0]
-            sampled = pd.concat([base, sampled_rest], axis=0)
+                stratify=y,
+            )
+            return sampled_X, sampled_y, True
 
-        sampled_y = sampled["__target__"]
-        sampled_X = sampled.drop(columns=["__target__"])
-        return sampled_X, sampled_y, True
+        # Preserve every class once when stratification is mathematically
+        # impossible (for example a class with a single row), then sample the
+        # remaining rows without a deprecated groupby-apply operation.
+        combined = pd.concat([X, pd.Series(y, index=X.index, name="__target__")], axis=1)
+        representative_indices = combined.groupby("__target__", dropna=False).head(1).index
+        representative = combined.loc[representative_indices]
+        remaining_count = max_rows - len(representative)
+        remainder = combined.drop(index=representative_indices).sample(
+            n=max(0, min(remaining_count, len(combined) - len(representative))),
+            random_state=random_state,
+        )
+        sampled = pd.concat([representative, remainder])
+        return sampled.drop(columns="__target__"), sampled["__target__"], True
 
     sampled_idx = X.sample(n=max_rows, random_state=random_state).index
     return X.loc[sampled_idx], y.loc[sampled_idx], True
-
-
-def build_preprocessor(numeric_cols, categorical_cols, categorical_strategy="ordinal"):
-    transformers = []
-
-    if numeric_cols:
-        transformers.append(
-            (
-                "num",
-                Pipeline([("imputer", SimpleImputer(strategy="constant", fill_value=0.0))]),
-                numeric_cols,
-            )
-        )
-
-    if categorical_cols:
-        encoder = (
-            OneHotEncoder(handle_unknown="ignore")
-            if categorical_strategy == "onehot"
-            else OrdinalEncoder(
-                handle_unknown="use_encoded_value",
-                unknown_value=-1,
-            )
-        )
-        transformers.append(
-            (
-                "cat",
-                Pipeline(
-                    [
-                        ("imputer", SimpleImputer(strategy="constant", fill_value="__missing__")),
-                        ("encoder", encoder),
-                    ]
-                ),
-                categorical_cols,
-            )
-        )
-
-    return ColumnTransformer(transformers=transformers)
-
-
-def get_candidate_models(problem_type, target_style_label=None, effort="standard", imbalance_ratio=None):
-    if problem_type == "classification":
-        models = {
-            "Gradient Boosting": {
-                "model": HistGradientBoostingClassifier(
-                    random_state=42,
-                    max_leaf_nodes=31,
-                ),
-                "categorical_strategy": "ordinal",
-            },
-            "Random Forest": {
-                "model": RandomForestClassifier(
-                    n_estimators=120,
-                    random_state=42,
-                    n_jobs=1,
-                    class_weight="balanced_subsample",
-                ),
-                "categorical_strategy": "ordinal",
-            },
-        }
-        if imbalance_ratio is not None and imbalance_ratio < 0.1:
-            models["Balanced Random Forest"] = {
-                "model": RandomForestClassifier(
-                    n_estimators=220,
-                    random_state=42,
-                    n_jobs=1,
-                    class_weight="balanced",
-                    min_samples_leaf=2,
-                ),
-                "categorical_strategy": "ordinal",
-            }
-        if effort == "expanded":
-            models["Gradient Boosting Deep"] = {
-                "model": HistGradientBoostingClassifier(
-                    random_state=42,
-                    max_leaf_nodes=63,
-                    learning_rate=0.06,
-                    min_samples_leaf=30,
-                ),
-                "categorical_strategy": "ordinal",
-            }
-            models["Extra Trees"] = {
-                "model": ExtraTreesClassifier(
-                    n_estimators=160,
-                    random_state=42,
-                    n_jobs=1,
-                    class_weight="balanced_subsample",
-                ),
-                "categorical_strategy": "ordinal",
-            }
-            models["Logistic Regression"] = {
-                "model": LogisticRegression(
-                    max_iter=2000,
-                    solver="lbfgs",
-                    class_weight="balanced" if imbalance_ratio is not None and imbalance_ratio < 0.1 else None,
-                ),
-                "categorical_strategy": "onehot",
-            }
-        return models
-    models = {
-        "Gradient Boosting": {
-            "model": HistGradientBoostingRegressor(
-                random_state=42,
-                max_leaf_nodes=31,
-            ),
-            "categorical_strategy": "ordinal",
-        },
-        "Random Forest": {
-            "model": RandomForestRegressor(
-                n_estimators=160,
-                random_state=42,
-                n_jobs=1,
-            ),
-            "categorical_strategy": "ordinal",
-        },
-        "Ridge Regression": {
-            "model": Ridge(alpha=1.0),
-            "categorical_strategy": "onehot",
-        },
-    }
-    if effort == "expanded":
-        models["Gradient Boosting Deep"] = {
-            "model": HistGradientBoostingRegressor(
-                random_state=42,
-                max_leaf_nodes=63,
-                learning_rate=0.05,
-                min_samples_leaf=20,
-            ),
-            "categorical_strategy": "ordinal",
-        }
-        models["Extra Trees"] = {
-            "model": ExtraTreesRegressor(
-                n_estimators=120,
-                random_state=42,
-                n_jobs=1,
-            ),
-            "categorical_strategy": "ordinal",
-        }
-        if target_style_label == "count-style regression":
-            models["Poisson Gradient Boosting"] = {
-                "model": HistGradientBoostingRegressor(
-                    random_state=42,
-                    loss="poisson",
-                    max_leaf_nodes=63,
-                    learning_rate=0.05,
-                    min_samples_leaf=20,
-                ),
-                "categorical_strategy": "ordinal",
-            }
-    return models
-
-
-def evaluate_predictions(problem_type, y_true, y_pred):
-    if problem_type == "classification":
-        return {
-            "accuracy": float(accuracy_score(y_true, y_pred)),
-            "precision": float(precision_score(y_true, y_pred, average="weighted", zero_division=0)),
-            "recall": float(recall_score(y_true, y_pred, average="weighted", zero_division=0)),
-            "f1": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
-        }
-    return {
-        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-        "mae": float(mean_absolute_error(y_true, y_pred)),
-        "r2": float(r2_score(y_true, y_pred)),
-    }
-
-
-def add_probability_metrics(problem_type, metrics, y_true, probabilities):
-    if problem_type != "classification" or probabilities is None:
-        return metrics
-
-    unique_classes = pd.Series(y_true).dropna().unique()
-    if len(unique_classes) != 2:
-        return metrics
-
-    try:
-        positive_scores = probabilities[:, 1]
-        metrics["roc_auc"] = float(roc_auc_score(y_true, positive_scores))
-        metrics["average_precision"] = float(average_precision_score(y_true, positive_scores))
-    except Exception:
-        return metrics
-    return metrics
-
-
-def build_baseline_metrics(problem_type, y_true):
-    if problem_type == "classification":
-        majority_class = y_true.mode(dropna=False).iloc[0]
-        baseline_pred = pd.Series([majority_class] * len(y_true), index=y_true.index)
-        metrics = evaluate_predictions(problem_type, y_true, baseline_pred)
-        if y_true.nunique(dropna=False) == 2:
-            class_counts = y_true.value_counts(normalize=True, dropna=False)
-            positive_label = class_counts.idxmin()
-            positive_rate = float(class_counts.loc[positive_label])
-            binary_true = (
-                pd.Series(y_true).reset_index(drop=True).eq(positive_label).fillna(False).astype(int)
-            )
-            baseline_scores = np.full(len(binary_true), positive_rate)
-            metrics["balanced_accuracy"] = float(balanced_accuracy_score(y_true, baseline_pred))
-            metrics["average_precision"] = float(average_precision_score(binary_true, baseline_scores))
-            metrics["roc_auc"] = 0.5
-        metrics["baseline_strategy"] = f"Predict majority class ({majority_class})"
-        return metrics
-
-    mean_value = float(y_true.mean())
-    baseline_pred = pd.Series([mean_value] * len(y_true), index=y_true.index)
-    metrics = evaluate_predictions(problem_type, y_true, baseline_pred)
-    metrics["baseline_strategy"] = f"Predict target mean ({mean_value:.3f})"
-    return metrics
 
 
 def assess_model_quality(problem_type, best_metrics, baseline_metrics):
@@ -1360,7 +1116,7 @@ def assess_model_quality(problem_type, best_metrics, baseline_metrics):
 
 def build_chart_context(problem_type, X_sample, y_sample, holdout_actual, holdout_pred, feature_importance):
     numeric_cols = X_sample.select_dtypes(include=["number", "bool"]).columns.tolist()
-    categorical_cols = X_sample.select_dtypes(include=["object", "category"]).columns.tolist()
+    categorical_cols = _categorical_column_names(X_sample)
     top_features = feature_importance["feature"].tolist() if not feature_importance.empty else []
 
     resolved_top_features = []
@@ -1428,10 +1184,6 @@ def build_chart_context(problem_type, X_sample, y_sample, holdout_actual, holdou
     return context
 
 
-def rank_metric(problem_type):
-    return "f1" if problem_type == "classification" else "rmse"
-
-
 def train_best_model(
     X,
     y,
@@ -1442,155 +1194,19 @@ def train_best_model(
     effort="standard",
     test_size=0.2,
     random_state=42,
+    positive_label=None,
 ):
-    X = pd.DataFrame(X).reset_index(drop=True)
-    _, y, dropped_before_split = filter_valid_target_rows(
-        None,
-        pd.Series(y).reset_index(drop=True),
-        "before train/test split",
-    )
-    X = X.loc[y.index].reset_index(drop=True)
-    y = y.reset_index(drop=True)
-
-    stratify = y if problem_type == "classification" and y.nunique(dropna=False) > 1 else None
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=stratify,
-    )
-    X_train, y_train, dropped_train = filter_valid_target_rows(
-        X_train,
-        y_train,
-        "training split",
-        min_rows=max(10, min(20, len(y_train))),
-    )
-    X_test, y_test, dropped_test = filter_valid_target_rows(
-        X_test,
-        y_test,
-        "test split",
-        min_rows=max(5, min(10, len(y_test))),
-    )
-
-    imbalance_ratio = None
-    if problem_type == "classification":
-        class_distribution = y.value_counts(normalize=True, dropna=False)
-        if not class_distribution.empty:
-            imbalance_ratio = float(class_distribution.min())
-
-    candidates = get_candidate_models(
-        problem_type,
-        target_style_label=target_style_label,
+    del numeric_cols, categorical_cols, target_style_label
+    target_name = str(getattr(y, "name", None) or "target")
+    config = AnalysisConfig(
+        target=target_name,
+        problem_type=problem_type,
+        positive_label=positive_label,
         effort=effort,
-        imbalance_ratio=imbalance_ratio,
+        test_size=test_size,
+        random_seed=random_state,
     )
-    results = {}
-    fitted = {}
-    thresholded_predictions = {}
-    probability_store = {}
-
-    for name, spec in candidates.items():
-        estimator = spec["model"]
-        categorical_strategy = spec.get("categorical_strategy", "ordinal")
-        pipe = Pipeline(
-            [
-                (
-                    "preprocessor",
-                    build_preprocessor(
-                        numeric_cols,
-                        categorical_cols,
-                        categorical_strategy=categorical_strategy,
-                    ),
-                ),
-                ("model", estimator),
-            ]
-        )
-        pipe.fit(X_train, y_train)
-        preds = pipe.predict(X_test)
-        probabilities = None
-
-        if problem_type == "classification" and hasattr(pipe, "predict_proba"):
-            try:
-                probabilities = pipe.predict_proba(X_test)
-                if probabilities.shape[1] == 2 and imbalance_ratio is not None and imbalance_ratio < 0.1:
-                    class_counts = y_train.value_counts(dropna=False)
-                    positive_label = class_counts.idxmin()
-                    class_labels = pipe.named_steps["model"].classes_
-                    positive_index = int(np.where(class_labels == positive_label)[0][0])
-                    positive_scores = probabilities[:, positive_index]
-                    binary_true = (
-                        pd.Series(y_test).reset_index(drop=True).eq(positive_label).fillna(False).astype(int)
-                    )
-                    precision, recall, thresholds = precision_recall_curve(binary_true, positive_scores)
-                    f1_scores = (2 * precision * recall) / np.clip(precision + recall, 1e-9, None)
-                    if len(thresholds):
-                        best_index = int(np.nanargmax(f1_scores[:-1]))
-                        threshold = thresholds[best_index]
-                        negative_label = next(label for label in class_labels if label != positive_label)
-                        tuned_preds = np.where(positive_scores >= threshold, positive_label, negative_label)
-                        preds = pd.Series(tuned_preds, index=X_test.index)
-            except Exception:
-                probabilities = None
-
-        metrics = evaluate_predictions(problem_type, y_test, preds)
-        metrics = add_probability_metrics(problem_type, metrics, y_test, probabilities)
-        if problem_type == "classification" and y_test.nunique(dropna=False) == 2:
-            metrics["balanced_accuracy"] = float(balanced_accuracy_score(y_test, preds))
-        results[name] = metrics
-        fitted[name] = pipe
-        thresholded_predictions[name] = preds
-        probability_store[name] = probabilities
-
-    metric = "average_precision" if problem_type == "classification" and imbalance_ratio is not None and imbalance_ratio < 0.1 else rank_metric(problem_type)
-    if metric not in next(iter(results.values())):
-        metric = rank_metric(problem_type)
-    if problem_type == "classification":
-        best_name = max(results, key=lambda model_name: results[model_name][metric])
-    else:
-        best_name = min(results, key=lambda model_name: results[model_name][metric])
-
-    best_model = fitted[best_name]
-    best_preds = thresholded_predictions[best_name]
-    return {
-        "results": results,
-        "best_model_name": best_name,
-        "best_model": best_model,
-        "best_metrics": results[best_name],
-        "metric_name": metric,
-        "X_test": X_test,
-        "y_test": y_test,
-        "preds": best_preds,
-        "best_probabilities": probability_store[best_name],
-        "imbalance_ratio": imbalance_ratio,
-        "dropped_target_rows": {
-            "before_split": dropped_before_split,
-            "train_split": dropped_train,
-            "test_split": dropped_test,
-        },
-    }
-
-
-def build_feature_importance(best_model, feature_names):
-    estimator = best_model.named_steps["model"]
-    if not hasattr(estimator, "feature_importances_"):
-        return pd.DataFrame(columns=["feature", "importance"])
-
-    frame = pd.DataFrame(
-        {"feature": feature_names, "importance": estimator.feature_importances_}
-    )
-    return frame.sort_values("importance", ascending=False).head(15)
-
-
-def get_feature_names(numeric_cols, categorical_cols):
-    return [f"num__{col}" for col in numeric_cols] + [f"cat__{col}" for col in categorical_cols]
-
-
-def align_prediction_frame(prediction_df, feature_columns):
-    missing = [col for col in feature_columns if col not in prediction_df.columns]
-    if missing:
-        raise ValueError("Prediction dataset is missing required columns: " + ", ".join(missing))
-    return prediction_df[feature_columns].copy()
+    return train_model(pd.DataFrame(X), pd.Series(y, name=target_name), config)
 
 
 def _build_analysis_result(
@@ -1659,10 +1275,17 @@ def run_analysis(
     drop_identifier_columns=True,
     training_effort="standard",
     extension_registry=None,
+    positive_label=None,
+    random_state=42,
+    dataset_profile=None,
+    precomputed_workflow=None,
 ):
-    sanitized_df = sanitize_dataframe(df)
+    if isinstance(dataset_profile, DatasetProfile):
+        sanitized_df = dataset_profile.sanitized_frame
+    else:
+        sanitized_df = sanitize_dataframe(df)
     selected_target = target_col if target_col in sanitized_df.columns else None
-    dataset_recommendation = recommend_dataset_workflow(
+    dataset_recommendation = precomputed_workflow or recommend_dataset_workflow(
         sanitized_df,
         drop_identifier_columns=drop_identifier_columns,
         top_n=min(8, len(sanitized_df.columns)),
@@ -1698,6 +1321,7 @@ def run_analysis(
             sanitized_df,
             selected_target,
             drop_identifier_columns=drop_identifier_columns,
+            prepare_features=False,
         )
     elif target_candidate is not None:
         target_assessment = {
@@ -1721,6 +1345,7 @@ def run_analysis(
             sanitized_df,
             selected_target,
             drop_identifier_columns=drop_identifier_columns,
+            prepare_features=False,
         )
 
     if target_assessment["mode_recommendation"] != "prediction":
@@ -1759,23 +1384,36 @@ def run_analysis(
     target_style = summarize_target_style(y, problem_type)
 
     sampled_X, sampled_y, sampled = sample_training_data(X, y, problem_type)
+    sampled_y.name = selected_target
     sampled_numeric = [col for col in prepared["numeric_cols"] if col in sampled_X.columns]
     sampled_categorical = [col for col in prepared["categorical_cols"] if col in sampled_X.columns]
 
+    training_kwargs = {
+        "target_style_label": target_style["label"],
+        "effort": training_effort,
+        "test_size": test_size,
+    }
+    if positive_label is not None:
+        training_kwargs["positive_label"] = positive_label
+    if random_state != 42:
+        training_kwargs["random_state"] = random_state
     trained = train_best_model(
         sampled_X,
         sampled_y,
         problem_type,
         sampled_numeric,
         sampled_categorical,
-        target_style_label=target_style["label"],
-        effort=training_effort,
-        test_size=test_size,
+        **training_kwargs,
     )
+    if trained.get("model_bundle") is not None:
+        trained["model_bundle"].identifier_reference = {
+            column: set(X[column].dropna().tolist())
+            for column in trained["model_bundle"].optional_identifier_columns
+            if column in X.columns
+        }
 
-    feature_names = get_feature_names(sampled_numeric, sampled_categorical)
-    feature_importance = build_feature_importance(trained["best_model"], feature_names)
-    baseline_metrics = build_baseline_metrics(problem_type, trained["y_test"])
+    feature_importance = trained["feature_importance"]
+    baseline_metrics = trained["baseline_metrics"]
     quality = assess_model_quality(problem_type, trained["best_metrics"], baseline_metrics)
 
     notes = list(prepared["notes"])
@@ -1797,6 +1435,8 @@ def run_analysis(
         )
     notes.extend(target_assessment["reasons_for_prediction"])
     notes.extend(target_assessment["reasons_against_prediction"])
+    notes.extend(trained.get("leakage_warnings", []))
+    notes.append("Internal validation is provisional until a labeled external dataset is evaluated.")
 
     prediction_preview = trained["X_test"].copy().reset_index(drop=True)
     prediction_preview["actual"] = pd.Series(trained["y_test"]).reset_index(drop=True)
@@ -1825,6 +1465,7 @@ def run_analysis(
                 "best_metrics": trained["best_metrics"],
                 "baseline_metrics": baseline_metrics,
                 "quality": quality,
+                "model_bundle": trained.get("model_bundle"),
             },
             extra_notes=notes,
             dataset_recommendation=dataset_recommendation,
@@ -1869,11 +1510,20 @@ def run_analysis(
         "results": trained["results"],
         "best_model_name": trained["best_model_name"],
         "best_model": trained["best_model"],
+        "model_bundle": trained.get("model_bundle"),
         "best_metrics": trained["best_metrics"],
         "baseline_metrics": baseline_metrics,
+        "cv_results": trained.get("cv_results", {}),
+        "positive_label": trained.get("positive_label"),
+        "decision_threshold": trained.get("decision_threshold"),
+        "validation_status": "provisional",
         "quality": quality,
         "metric_name": trained["metric_name"],
-        "feature_columns": sampled_X.columns.tolist(),
+        "feature_columns": (
+            trained["model_bundle"].required_feature_columns
+            if trained.get("model_bundle") is not None
+            else sampled_X.columns.tolist()
+        ),
         "feature_importance": feature_importance,
         "chart_context": chart_context,
         "prediction_preview": prediction_preview.head(MAX_PREVIEW_ROWS),
