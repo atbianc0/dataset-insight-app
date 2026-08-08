@@ -1,6 +1,6 @@
 # Direct runtime requirements. Compile and test requirements.txt when updating.
 pandas==2.3.3
-numpy==2.4.4
+numpy==2.5.1
 scikit-learn==1.8.0
 streamlit==1.56.0
 matplotlib==3.10.8
