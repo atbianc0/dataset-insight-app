@@ -73,8 +73,8 @@ jobs:
           cache: pip
       - name: Install auditor
         run: python -m pip install pip-audit==2.10.1
-      - name: Audit pinned runtime dependencies
-        run: python -m pip_audit --requirement requirements.txt
+      - name: Audit pinned runtime and development dependencies
+        run: python -m pip_audit --requirement requirements-dev.txt
 
   secrets:
     name: Secret scan

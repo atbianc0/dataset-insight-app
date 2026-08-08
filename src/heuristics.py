@@ -1,5 +1,6 @@
 import re
 import warnings
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -18,11 +19,79 @@ COMMON_MISSING_TOKENS = {
     "--",
 }
 
+PREFERRED_POSITIVE_LABELS = (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "positive",
+    "churn",
+    "churned",
+    "failed",
+    "fraud",
+    "default",
+)
+
+
+def _positive_label_token(label: Any) -> str:
+    token = str(label).strip().lower()
+    try:
+        if float(token) == 1.0:
+            return "1"
+    except ValueError:
+        pass
+    return token
+
 
 def safe_ratio(numerator, denominator):
     if not denominator:
         return 0.0
     return float(numerator) / float(denominator)
+
+
+def infer_binary_positive_label(
+    series,
+    requested_label: Any | None = None,
+    *,
+    labels: list[Any] | None = None,
+) -> Any | None:
+    """Resolve one stable positive label for binary targets only.
+
+    Recognizable outcome labels take precedence. Otherwise, the less common
+    class is positive; tied classes use a deterministic textual ordering.
+    """
+
+    values = pd.Series(series).dropna()
+    available = list(labels) if labels is not None else values.unique().tolist()
+    if len(available) != 2:
+        if requested_label is not None:
+            raise ValueError("A positive label override is only valid for binary classification.")
+        return None
+
+    if requested_label is not None:
+        exact_matches = [label for label in available if label == requested_label]
+        if exact_matches:
+            return exact_matches[0]
+        text_matches = [label for label in available if str(label) == str(requested_label)]
+        if len(text_matches) == 1:
+            return text_matches[0]
+        raise ValueError(f"Positive label {requested_label!r} is not present in the target column.")
+
+    normalized = {
+        _positive_label_token(label): label
+        for label in sorted(available, key=lambda value: (type(value).__name__, str(value)))
+    }
+    for preferred in PREFERRED_POSITIVE_LABELS:
+        if preferred in normalized:
+            return normalized[preferred]
+
+    counts = values.value_counts(dropna=False)
+    minimum_count = min(int(counts.get(label, 0)) for label in available)
+    least_common = [label for label in available if int(counts.get(label, 0)) == minimum_count]
+    return sorted(
+        least_common,
+        key=lambda value: (type(value).__name__, str(value)),
+    )[-1]
 
 
 def is_integer_like(series, tolerance=1e-9):
@@ -100,7 +169,10 @@ def is_identifier_like(series, name):
         or (compact_name.endswith("id") and compact_name[:-2] in compact_entity_names)
         or bool(name_tokens & {"id", "uuid", "guid", "identifier"})
     )
-    if identifier_name and unique_ratio > 0.75:
+    # Explicit ID tokens describe entity keys even when each entity appears on
+    # many rows. Requiring near-uniqueness would misclassify repeated customer,
+    # account, or session IDs as ordinary model features.
+    if identifier_name and non_null.nunique() > 1:
         return True
 
     if pd.api.types.is_numeric_dtype(non_null):

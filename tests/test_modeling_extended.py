@@ -151,7 +151,10 @@ def test_multiclass_and_target_normalization_edge_cases():
     assert trained["metric_name"] == "f1_macro"
     assert "average_precision" not in trained["best_metrics"]
     assert normalise_target(pd.Series([True, False, True]), "classification").dtype == bool
-    assert normalise_target(pd.Series(["1.5", "2.5"]), "classification").dtype == float
+    assert normalise_target(pd.Series(["1.5", "2.5"]), "classification").tolist() == [
+        "1.5",
+        "2.5",
+    ]
     assert detect_leakage(frame, None, "Outcome", "classification") == (set(), [])
     with pytest.raises(ValueError, match="only valid for binary"):
         infer_positive_label(["a", "b", "c"], target, requested="a")
@@ -167,6 +170,25 @@ def test_multiclass_and_target_normalization_edge_cases():
         positive_label=1,
     )
     assert "average_precision" not in metrics
+
+
+def test_mostly_numeric_string_classification_labels_remain_safe_strings():
+    rows = 100
+    frame = pd.DataFrame(
+        {
+            "measure": np.sin(np.arange(rows)),
+            "segment": ["north", "south"] * 50,
+        }
+    )
+    target = pd.Series((["0", "1"] * 47) + ["other"] * 6, name="Outcome")
+
+    trained = train_model(
+        frame,
+        target,
+        AnalysisConfig(target="Outcome", problem_type="classification", random_seed=14),
+    )
+
+    assert set(trained["model_bundle"].class_labels) == {"0", "1", "other"}
 
 
 @pytest.mark.parametrize(

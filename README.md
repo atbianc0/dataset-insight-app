@@ -95,15 +95,17 @@ On the documented Apple M1 development machine, all release targets pass:
 
 | Gate | Observed | Target |
 | --- | ---: | ---: |
-| Netflix profile | 0.21 s | < 3 s |
-| Churn testing profile | 0.35 s | < 8 s |
-| Full churn training profile | 2.37 s | < 20 s |
-| Standard training + complete external evaluation | 11.34 s | < 60 s |
-| Peak memory for the end-to-end workflow | 1.08 GiB | < 1.5 GB |
+| Netflix profile | 0.24 s | < 3 s |
+| Churn testing profile | 0.33 s | < 8 s |
+| Full churn training profile | 2.41 s | < 20 s |
+| Standard training + complete external evaluation | 10.80 s | < 60 s |
+| Peak memory for the end-to-end workflow | 0.70 GiB | < 1.5 GB |
 
 The benchmark uses the checked-in fixture hashes, a deterministic 60,000-row
-training sample, and all 64,374 external rows. Machine, command, and result
-details are versioned in [`benchmarks/v1_reference.json`](benchmarks/v1_reference.json).
+training sample, and all 64,374 external rows. Machine, configuration, protocol,
+and result details are versioned in
+[`benchmarks/v1_reference.json`](benchmarks/v1_reference.json) and
+[`benchmarks/README.md`](benchmarks/README.md).
 
 ## How analysis works
 
@@ -129,17 +131,19 @@ low-support findings stay in technical detail. See
 
 ## Privacy and optional AI
 
-The deterministic app needs no API key. User uploads are processed in the
-running Streamlit session and are not intentionally written to a database or
-artifact store by DataLens. Only checked-in public examples may use shared app
-caching. The deployment operator is still responsible for server memory, logs,
-network controls, platform retention, and access policy.
+The deterministic app needs no API key. User uploads are sent to the running
+Streamlit server, held in session-scoped memory, and not intentionally written
+to a database or artifact store by DataLens. Only checked-in public examples may
+use shared app caching. The deployment operator is still responsible for server
+memory, logs, network controls, platform retention, and access policy.
 
 The OpenAI assistant is optional, advisory, and off by default. It appears only
 when `OPENAI_API_KEY` is configured and runs only after the user explicitly
-enables it. Requests contain bounded aggregate/schema context—such as column
-names, roles, coverage, candidate summaries, and analysis headlines—not uploaded
-rows, sample values, or identifier values. Requests leave the app process and are
+enables it. Requests use an explicit allowlist of bounded aggregate/schema
+context: column names, data types, roles, coverage/missingness, uniqueness, row
+and column counts, and numeric target-candidate metadata. Uploaded rows, sample
+values, category labels/counts, identifier or name values, derived headlines,
+and free-text findings are excluded. Requests leave the app process and are
 subject to the configured OpenAI account's terms and controls.
 
 For local opt-in use:
@@ -173,7 +177,7 @@ python -m pip install -r requirements-dev.txt
 python -m ruff check app.py src tests
 python -m pytest -W error
 python -m pytest --cov=src --cov-branch --cov-report=term-missing
-python -m pip_audit -r requirements.txt
+python -m pip_audit -r requirements-dev.txt
 ```
 
 Or use `make check`. CI covers Python 3.11 and 3.12, secret scanning, dependency

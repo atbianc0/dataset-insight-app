@@ -70,9 +70,10 @@ model or insight logic.
 
 CSV, TSV, TXT, and XLSX inputs are parsed once. Blank and whitespace-only names
 are normalized, but duplicate names after trimming are rejected. Accepted tables
-are bounded by bytes, rows, columns, and cells. Sanitation normalizes documented
-missing tokens and safe numeric strings while retaining exact dataset-level
-counts. Expensive analysis uses a seeded sample.
+are bounded by bytes, rows, columns, and cells. Profile sanitation normalizes
+documented missing tokens while retaining exact dataset-level counts. Numeric-
+string and other learned conversions are fitted from training rows only, after
+the final holdout is separated. Expensive analysis uses a seeded sample.
 
 ### Workflow and target decision
 

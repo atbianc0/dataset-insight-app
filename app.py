@@ -396,12 +396,60 @@ def _render_confusion_matrix(payload: dict[str, Any]) -> None:
         plt.close(fig)
 
 
+def _render_external_validation(scoring_result: Any | None, positive_label: Any | None) -> None:
+    if scoring_result is None:
+        st.warning("No external validation result is available yet.")
+        return
+
+    st.subheader("External validation and distribution shift")
+    readiness = scoring_result.readiness or {}
+    status = readiness.get("status", "provisional")
+    summary = readiness.get("summary", "")
+    if status == "not deployment-ready":
+        st.error(f"{status.title()}: {summary}")
+    elif status == "externally validated":
+        st.success(f"{status.title()}: {summary}")
+    else:
+        st.warning(f"{status.title()}: {summary}")
+
+    for warning in scoring_result.schema_warnings:
+        st.warning(warning)
+    external = _numeric_metrics(scoring_result.external_metrics)
+    if not external.empty:
+        _dataframe(external)
+    external_metrics = scoring_result.external_metrics or {}
+    external_support = external_metrics.get("support") or {}
+    evaluated_rows = external_metrics.get("evaluated_rows")
+    if positive_label is not None and evaluated_rows:
+        positive_support = external_support.get(str(positive_label))
+        if positive_support is not None:
+            st.metric(
+                "External target prevalence",
+                f"{float(positive_support) / float(evaluated_rows):.2%}",
+                help=(
+                    f"Positive label {positive_label}: {int(positive_support):,} of "
+                    f"{int(evaluated_rows):,} externally labeled rows."
+                ),
+            )
+
+    drift = scoring_result.drift_summary or {}
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Drift level", str(drift.get("level", "unknown")).title())
+    d2.metric("Max numeric SMD", f"{drift.get('max_standardized_mean_difference', 0):.3f}")
+    d3.metric("Max categorical TVD", f"{drift.get('max_total_variation_distance', 0):.3f}")
+    d4.metric("Overlapping IDs", f"{drift.get('identifier_overlap_total', 0):,}")
+
+
 def _render_model_validation(result: dict[str, Any], scoring_result: Any | None) -> None:
     if result.get("mode") != "prediction":
         attempt = result.get("predictive_attempt")
         if attempt:
+            st.subheader("Internal validation — weak fallback")
             st.warning(attempt["quality"]["summary"])
             _dataframe(_numeric_metrics(attempt.get("best_metrics")))
+            bundle = attempt.get("model_bundle")
+            positive_label = getattr(bundle, "positive_label", None)
+            _render_external_validation(scoring_result, positive_label)
         else:
             st.info("No predictive model was selected for this analysis.")
         return
@@ -461,33 +509,7 @@ def _render_model_validation(result: dict[str, Any], scoring_result: Any | None)
                 plt.close(fig)
         _dataframe(importance)
 
-    if scoring_result is None:
-        st.warning("No external validation result is available yet.")
-        return
-
-    st.subheader("External validation and distribution shift")
-    readiness = scoring_result.readiness or {}
-    status = readiness.get("status", "provisional")
-    summary = readiness.get("summary", "")
-    if status == "not deployment-ready":
-        st.error(f"{status.title()}: {summary}")
-    elif status == "externally validated":
-        st.success(f"{status.title()}: {summary}")
-    else:
-        st.warning(f"{status.title()}: {summary}")
-
-    for warning in scoring_result.schema_warnings:
-        st.warning(warning)
-    external = _numeric_metrics(scoring_result.external_metrics)
-    if not external.empty:
-        _dataframe(external)
-
-    drift = scoring_result.drift_summary or {}
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("Drift level", str(drift.get("level", "unknown")).title())
-    d2.metric("Max numeric SMD", f"{drift.get('max_standardized_mean_difference', 0):.3f}")
-    d3.metric("Max categorical TVD", f"{drift.get('max_total_variation_distance', 0):.3f}")
-    d4.metric("Overlapping IDs", f"{drift.get('identifier_overlap_total', 0):,}")
+    _render_external_validation(scoring_result, positive_label)
 
 
 def _render_technical(
@@ -747,7 +769,8 @@ with st.sidebar:
             st.caption("AI is off. No OpenAI secret is configured, and the app works fully without one.")
         st.caption(
             "AI receives aggregate schema/statistics only—never uploaded rows, sample values, identifier values, or name values. "
-            "Uploaded data stays in this browser session and is not put in a shared cache."
+            "Uploads are processed in this server-side app session, are not put in a shared cache, "
+            "and are not intentionally persisted by DataLens."
         )
     ai_enabled = bool(ai_available and ai_requested and ai_consent)
 
@@ -898,19 +921,21 @@ with st.expander("Advanced target semantics", expanded=False):
         st.caption("Choose an outcome column to review positive-label semantics.")
     else:
         labels = profile.sanitized_frame[selected_target].dropna().unique().tolist()
-        if 1 < len(labels) <= 20:
-            label_options: list[Any] = ["Automatic inference", *labels]
+        if len(labels) == 2:
+            label_options: list[Any | None] = [None, *labels]
             chosen_label = st.selectbox(
                 "Positive label",
                 label_options,
                 key=f"positive_label_{input_key[:16]}_{selected_target}",
-                format_func=str,
+                format_func=lambda label: (
+                    "Automatic inference" if label is None else str(label)
+                ),
                 help="Used consistently for probabilities, AP, ROC-AUC, confusion matrices, and exports.",
             )
-            if chosen_label != "Automatic inference":
+            if chosen_label is not None:
                 positive_label_override = chosen_label
         else:
-            st.caption("Positive-label override is available for classification targets with 2–20 labels.")
+            st.caption("Positive-label override is available only for binary classification targets.")
 
 analysis_signature = (
     input_key,

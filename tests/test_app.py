@@ -44,6 +44,8 @@ def test_blank_state_has_three_clear_sources_and_no_ai_requirement(monkeypatch):
     ]
     assert any("No API key is required" in message.value for message in app.info)
     assert any("AI is off" in caption.value for caption in app.caption)
+    assert any("server-side app session" in caption.value for caption in app.caption)
+    assert all("stays in this browser session" not in caption.value for caption in app.caption)
     assert all("XLS file" not in markdown.value for markdown in app.markdown)
 
 
@@ -107,6 +109,86 @@ def test_upload_duplicate_headers_is_a_recoverable_error():
     assert "Duplicate columns: customer_id" in app.error[0].value
 
 
+def test_multiclass_target_does_not_offer_a_positive_label_override():
+    lines = ["measure,segment,Outcome"]
+    labels = ["low", "medium", "high"]
+    lines.extend(
+        f"{index},{chr(65 + index % 3)},{labels[index % 3]}" for index in range(90)
+    )
+
+    app = _app()
+    _button(app, "Choose Upload").click().run()
+    app.file_uploader[0].upload(
+        "multiclass.csv",
+        ("\n".join(lines) + "\n").encode("utf-8"),
+        "text/csv",
+    ).run()
+
+    assert not app.exception
+    assert app.selectbox[0].value == "Outcome"
+    assert all(selectbox.label != "Positive label" for selectbox in app.selectbox)
+    assert any(
+        "only for binary classification" in caption.value for caption in app.caption
+    )
+
+
+def test_weak_fallback_still_renders_external_validation_evidence():
+    def fixture_bytes(rows, identifier_prefix):
+        lines = ["CustomerID,feature_a,feature_b,segment,Churn"]
+        segments = ["A", "B", "C", "D", "E"]
+        lines.extend(
+            f"{identifier_prefix}{index},{index % 7},{(index * 3) % 11},"
+            f"{segments[index % len(segments)]},{index % 2}"
+            for index in range(rows)
+        )
+        return ("\n".join(lines) + "\n").encode("utf-8")
+
+    app = _app()
+    _button(app, "Choose Upload").click().run()
+    app.file_uploader[0].upload(
+        "weak-training.csv",
+        fixture_bytes(120, "TRAIN-"),
+        "text/csv",
+    ).run()
+
+    assert app.selectbox[0].value == "Churn"
+    _button(app, "Run analysis").click().run()
+    assert app.session_state["analysis_result"]["mode"] == "analysis"
+    assert app.session_state["analysis_result"]["predictive_attempt"] is not None
+
+    scoring_uploader = next(
+        uploader
+        for uploader in app.file_uploader
+        if uploader.label == "Upload compatible raw rows"
+    )
+    scoring_uploader.upload(
+        "weak-validation.csv",
+        fixture_bytes(60, "VALIDATION-"),
+        "text/csv",
+    ).run()
+    _button(app, "Score or evaluate file").click().run()
+
+    scoring = app.session_state["scoring_result"]
+    assert scoring.external_metrics["evaluated_rows"] == 60
+    assert scoring.readiness["status"] == "not deployment-ready"
+    assert any(
+        item.value == "External validation and distribution shift"
+        for item in app.subheader
+    )
+    external_tables = [
+        element.value
+        for element in app.dataframe
+        if list(element.value.columns) == ["metric", "value"]
+        and "Evaluated Rows" in element.value["metric"].tolist()
+    ]
+    assert len(external_tables) == 1
+    assert "Average Precision" in external_tables[0]["metric"].tolist()
+    assert _metric_value(app, "External target prevalence") == "50.00%"
+    assert _metric_value(app, "Drift level") == "Low"
+    assert _metric_value(app, "Overlapping IDs") == "0"
+    assert any("not deployment-ready" in message.value.lower() for message in app.error)
+
+
 @pytest.mark.full
 def test_churn_example_pairs_validation_data_and_selects_churn(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -135,3 +217,4 @@ def test_churn_example_pairs_validation_data_and_selects_churn(monkeypatch):
     assert scoring.drift_summary["identifier_overlap_total"] == 62_995
     assert scoring.readiness["status"] == "not deployment-ready"
     assert {"probability_0", "probability_1"}.issubset(scoring.scored_rows.columns)
+    assert _metric_value(app, "External target prevalence") == "47.37%"

@@ -22,6 +22,7 @@ COPY --chown=datalens:datalens app.py ./
 COPY --chown=datalens:datalens src ./src
 COPY --chown=datalens:datalens sample_data ./sample_data
 COPY --chown=datalens:datalens .streamlit ./.streamlit
+COPY --chown=datalens:datalens LICENSE DATASETS.md ./
 
 USER datalens
 EXPOSE 8501

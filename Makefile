@@ -19,7 +19,7 @@ coverage:
 	python -m pytest --cov=src --cov-branch --cov-report=term-missing
 
 audit:
-	python -m pip_audit --requirement requirements.txt
+	python -m pip_audit --requirement requirements-dev.txt
 
 check: lint coverage audit
 

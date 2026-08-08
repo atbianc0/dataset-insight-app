@@ -100,6 +100,14 @@ class OpenAIDatasetInterpretationAssistant(PipelineExtension):
         return self._cache[cache_key]
 
     def _build_ai_payload(self, context):
+        """Build an aggregate-only payload from an explicit privacy allowlist.
+
+        This method deliberately does not inspect ``context.df``. It also excludes
+        samples, category labels/counts, insight headlines, and heuristic prose:
+        those fields can contain uploaded values even when they were produced by a
+        deterministic analysis stage.
+        """
+
         workflow = context.artifacts.get("workflow") or {}
         insight_analysis = context.artifacts.get("insight_analysis") or {}
         feature_subset = context.artifacts.get("feature_subset_summary") or {}
@@ -117,7 +125,6 @@ class OpenAIDatasetInterpretationAssistant(PipelineExtension):
                         "coverage_pct": row.get("coverage_pct"),
                         "missing_pct": row.get("missing_pct"),
                         "unique_values": row.get("unique_values"),
-                        "heuristic_recommendation": row.get("recommendation"),
                     }
                 )
 
@@ -128,11 +135,12 @@ class OpenAIDatasetInterpretationAssistant(PipelineExtension):
                     "column": candidate.get("column"),
                     "status": candidate.get("status"),
                     "problem_type": candidate.get("problem_type"),
-                    "target_shape": candidate.get("target_shape"),
                     "score": candidate.get("score"),
-                    "pros": candidate.get("pros", [])[:2],
-                    "cautions": candidate.get("cautions", [])[:2],
-                    "blockers": candidate.get("blockers", [])[:2],
+                    "usable_rows": candidate.get("usable_rows"),
+                    "missing_pct": candidate.get("missing_pct"),
+                    "unique_count": candidate.get("unique_count"),
+                    "unique_ratio": candidate.get("unique_ratio"),
+                    "usable_feature_count": candidate.get("usable_feature_count"),
                 }
             )
 
@@ -142,8 +150,6 @@ class OpenAIDatasetInterpretationAssistant(PipelineExtension):
                 {
                     "column": item.get("column"),
                     "role": item.get("role"),
-                    "guidance": item.get("guidance"),
-                    "reason": item.get("reason"),
                 }
                 for item in feature_subset.get(bucket, [])[:MAX_FEATURES_PER_BUCKET]
             ]
@@ -162,21 +168,19 @@ class OpenAIDatasetInterpretationAssistant(PipelineExtension):
                 "recommended_workflow": workflow.get("recommended_workflow"),
                 "recommended_task_type": workflow.get("recommended_task_type"),
                 "recommended_primary_target": workflow.get("recommended_primary_target"),
-                "summary": workflow.get("summary"),
-                "best_analysis_path": workflow.get("best_analysis_path"),
             },
             "selected_target": context.target_col,
             "candidate_targets": candidate_targets,
-            "multi_target_candidates": workflow.get("multi_target_candidates", [])[:3],
             "feature_guidance": feature_buckets,
             "column_inspection": column_rows,
-            "analysis_headlines": insight_analysis.get("headlines", [])[:5],
             "target_assessment": {
+                "problem_type": target_assessment.get("problem_type"),
                 "mode_recommendation": target_assessment.get("mode_recommendation"),
-                "summary": target_assessment.get("summary"),
-                "reasons_for_prediction": target_assessment.get("reasons_for_prediction", [])[:3],
-                "reasons_against_prediction": target_assessment.get("reasons_against_prediction", [])[:3],
-                "blockers": target_assessment.get("blockers", [])[:3],
+                "usable_rows": target_assessment.get("usable_rows"),
+                "missing_ratio": target_assessment.get("missing_ratio"),
+                "unique_count": target_assessment.get("unique_count"),
+                "unique_ratio": target_assessment.get("unique_ratio"),
+                "usable_feature_count": target_assessment.get("usable_feature_count"),
             },
         }
 

@@ -2,7 +2,8 @@
 
 Release performance is measured with the exact fixtures recorded in
 `sample_data/fixtures.json`. The profiling timers include parsing, sanitation,
-role inference, and exact table-level counts. The end-to-end timer starts before
+role inference, and exact table-level counts; reported fixture results are the
+median of three runs. The end-to-end timer starts before
 the churn workflow decision and ends after complete external scoring, metrics,
 drift, and entity-overlap analysis.
 

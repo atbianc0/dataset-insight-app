@@ -16,7 +16,8 @@
       "license": {
         "spdx": "CC0-1.0",
         "name": "CC0 1.0 Universal",
-        "url": "https://creativecommons.org/publicdomain/zero/1.0/"
+        "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "text_path": "sample_data/LICENSES/CC0-1.0.txt"
       },
       "schema": {
         "column_count": 12,
@@ -63,6 +64,10 @@
         "leading_exploded_country": {
           "value": "United States",
           "count": 3690
+        },
+        "leading_rating": {
+          "value": "TV-MA",
+          "count": 3207
         }
       }
     },
@@ -79,7 +84,8 @@
       "license": {
         "spdx": "GPL-2.0-only",
         "name": "GNU General Public License v2.0",
-        "url": "https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html"
+        "url": "https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html",
+        "text_path": "sample_data/LICENSES/GPL-2.0-only.txt"
       },
       "schema": {
         "column_count": 12,
@@ -125,7 +131,8 @@
       "license": {
         "spdx": "GPL-2.0-only",
         "name": "GNU General Public License v2.0",
-        "url": "https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html"
+        "url": "https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html",
+        "text_path": "sample_data/LICENSES/GPL-2.0-only.txt"
       },
       "schema": {
         "column_count": 12,

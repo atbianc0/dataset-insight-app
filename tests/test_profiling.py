@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from src.profiling import build_dataset_profile, fingerprint_dataframe
+from src.profiling import build_dataset_profile, fingerprint_dataframe, sanitize_for_profile
 
 
 def test_profile_keeps_exact_counts_and_uses_a_deterministic_analysis_sample():
@@ -55,3 +55,13 @@ def test_fingerprint_changes_with_values_or_schema():
 
     assert fingerprint_dataframe(frame) != fingerprint_dataframe(pd.DataFrame({"value": [1, 3]}))
     assert fingerprint_dataframe(frame) != fingerprint_dataframe(pd.DataFrame({"other": [1, 2]}))
+
+
+def test_profile_does_not_learn_numeric_string_schema_from_holdout_rows():
+    values = [str(index) for index in range(95)] + ["not-numeric"] * 5
+    frame = pd.DataFrame({"mixed_measure": pd.Series(values, dtype="string")})
+
+    sanitized = sanitize_for_profile(frame)
+
+    assert pd.api.types.is_string_dtype(sanitized["mixed_measure"])
+    assert sanitized["mixed_measure"].iloc[-1] == "not-numeric"

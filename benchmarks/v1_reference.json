@@ -1,6 +1,6 @@
 {
   "benchmark_version": "1.0",
-  "recorded_at": "2026-08-07",
+  "recorded_at": "2026-08-08",
   "machine": {
     "model": "Apple M1",
     "memory_gib": 16,
@@ -21,16 +21,29 @@
     "customer_churn_dataset-testing-master.csv": "330af932f2dc1cae917f3bd0fb29395c4021319dd906189b7dc257d0ad58a617"
   },
   "results": {
-    "profile_seconds": {
-      "netflix": 0.213,
-      "churn_testing": 0.354,
-      "churn_training": 2.369
+    "parse_seconds": {
+      "netflix": 0.049,
+      "churn_testing": 0.055,
+      "churn_training": 0.371
     },
-    "standard_training_seconds": 10.535,
-    "external_scoring_seconds": 0.8,
-    "standard_training_and_external_evaluation_seconds": 11.335,
-    "workflow_peak_resident_bytes": 1154793472,
-    "workflow_peak_resident_gib": 1.076,
+    "profile_only_seconds": {
+      "netflix": 0.192,
+      "churn_testing": 0.27,
+      "churn_training": 2.041
+    },
+    "profile_seconds": {
+      "netflix": 0.244,
+      "churn_testing": 0.327,
+      "churn_training": 2.412
+    },
+    "workflow_ranking_seconds": 8.606,
+    "standard_training_seconds": 9.892,
+    "external_scoring_seconds": 0.906,
+    "standard_training_and_external_evaluation_seconds": 10.798,
+    "workflow_training_and_external_evaluation_seconds": 19.404,
+    "complete_journey_seconds": 22.161,
+    "workflow_peak_resident_bytes": 753549312,
+    "workflow_peak_resident_gib": 0.702,
     "external_rows_scored": 64374,
     "overlapping_identifiers": 62995,
     "internal_average_precision": 0.999999,
@@ -43,17 +56,15 @@
   "verification": {
     "full_suite_runs": [
       {
-        "tests_passed": 72,
-        "pytest_seconds": 63.83,
-        "maximum_resident_bytes": 1517764608
+        "tests_passed": 110,
+        "pytest_seconds": 71.26
       },
       {
-        "tests_passed": 72,
-        "pytest_seconds": 63.78,
-        "maximum_resident_bytes": 1495203840
+        "tests_passed": 110,
+        "pytest_seconds": 72.71
       }
     ],
-    "note": "Full-suite memory retains several independent AppTest sessions; the peak-memory release target applies to the single end-to-end application workflow above."
+    "note": "Profile values are median parse-plus-profile wall times from three runs. The peak-memory release target applies to the fresh-process application workflow, not the test runner."
   },
   "targets": {
     "netflix_profile_seconds": 3,

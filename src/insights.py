@@ -15,6 +15,7 @@ import pandas as pd
 
 from src.heuristics import (
     classify_general_column_role,
+    infer_binary_positive_label,
 )
 from src.heuristics import (
     is_datetime_candidate as _is_datetime_candidate,
@@ -31,6 +32,7 @@ from src.heuristics import (
 
 MAX_SAMPLE_VALUES = 3
 MAX_CORRELATIONS = 10
+MAX_CORRELATION_COLUMNS = 40
 MAX_GROUP_ROWS = 12
 MAX_ANOMALIES = 10
 MAX_ANALYSIS_ROWS = 50_000
@@ -40,6 +42,12 @@ CORRELATION_MIN_PAIRED_ROWS = 30
 CORRELATION_MIN_COVERAGE = 0.60
 CORRELATION_MIN_EFFECT = 0.30
 CORRELATION_MAX_ADJUSTED_P = 0.05
+TARGET_ASSOCIATION_MIN_ROWS = 30
+TARGET_ASSOCIATION_MIN_SHARE = 0.01
+TARGET_ASSOCIATION_MIN_COVERAGE = 0.60
+TARGET_ASSOCIATION_MIN_RATE_DIFFERENCE = 0.10
+TARGET_ASSOCIATION_MIN_NUMERIC_EFFECT = 0.30
+TARGET_ASSOCIATION_MAX_ADJUSTED_P = 0.05
 ANOMALY_THRESHOLD = 4.5
 
 _OUTCOME_NAMES = {
@@ -243,10 +251,32 @@ def _benjamini_hochberg(p_values):
     return adjusted.tolist()
 
 
-def _build_correlations(df):
+def _select_correlation_columns(df):
+    """Bound pairwise work while choosing useful columns deterministically."""
+
     numeric_cols = _numeric_columns(df)
+    ranked = sorted(
+        numeric_cols,
+        key=lambda column: (
+            -int(df[column].notna().sum()),
+            -int(df[column].nunique(dropna=True)),
+            str(column).lower(),
+        ),
+    )
+    return ranked[:MAX_CORRELATION_COLUMNS], len(ranked)
+
+
+def _build_correlations(df):
+    numeric_cols, candidate_count = _select_correlation_columns(df)
+    metadata = {
+        "candidate_columns": candidate_count,
+        "analyzed_columns": len(numeric_cols),
+        "omitted_columns": max(0, candidate_count - len(numeric_cols)),
+    }
     if len(numeric_cols) < 2:
-        return pd.DataFrame()
+        result = pd.DataFrame()
+        result.attrs["column_selection"] = metadata
+        return result
 
     analysis_frame = _bounded_frame(df, numeric_cols)
     analysis_rows = len(analysis_frame)
@@ -275,7 +305,9 @@ def _build_correlations(df):
             )
 
     if not pairs:
-        return pd.DataFrame()
+        result = pd.DataFrame()
+        result.attrs["column_selection"] = metadata
+        return result
 
     adjusted = _benjamini_hochberg([row["p_value"] for row in pairs])
     for row, adjusted_p in zip(pairs, adjusted):
@@ -298,7 +330,9 @@ def _build_correlations(df):
         "p_value": 6,
         "adjusted_p_value": 6,
     }
-    return frame.head(MAX_CORRELATIONS).reset_index(drop=True).round(numeric_rounding)
+    result = frame.head(MAX_CORRELATIONS).reset_index(drop=True).round(numeric_rounding)
+    result.attrs["column_selection"] = metadata
+    return result
 
 
 def _build_group_summary(df, target_col=None):
@@ -592,31 +626,44 @@ def _infer_association_target(df, target_col=None):
 
 
 def _infer_positive_label(series):
-    values = pd.Series(series).dropna().unique().tolist()
-    if not values:
-        return None
-    if pd.api.types.is_bool_dtype(series):
-        return True if True in values else values[-1]
-    preferred = {"1", "yes", "true", "positive", "churn", "churned", "fraud", "default"}
-    for value in values:
-        if str(value).strip().lower() in preferred:
-            return value
-    if pd.api.types.is_numeric_dtype(series):
-        return max(values)
-    return sorted(values, key=lambda value: str(value))[-1]
+    return infer_binary_positive_label(series)
 
 
-def _build_target_associations(df, target_col):
+def _resolve_positive_label(series, requested_label=None):
+    return infer_binary_positive_label(series, requested_label)
+
+
+def _normal_two_sided_p(statistic):
+    if not np.isfinite(statistic):
+        return 1.0
+    return float(math.erfc(abs(float(statistic)) / math.sqrt(2)))
+
+
+def _wilson_interval(successes, total, z_value=1.96):
+    if total <= 0:
+        return np.nan, np.nan
+    rate = successes / total
+    denominator = 1 + (z_value**2 / total)
+    center = (rate + z_value**2 / (2 * total)) / denominator
+    radius = (
+        z_value
+        * math.sqrt((rate * (1 - rate) / total) + (z_value**2 / (4 * total**2)))
+        / denominator
+    )
+    return max(0.0, center - radius), min(1.0, center + radius)
+
+
+def _build_target_associations(df, target_col, positive_label=None):
     empty_overview = None
     if target_col not in df.columns:
         return empty_overview, pd.DataFrame(), []
     target = df[target_col]
     usable_target = target.dropna()
     unique_values = usable_target.unique().tolist()
-    if not 2 <= len(unique_values) <= 20:
+    if len(unique_values) != 2:
         return empty_overview, pd.DataFrame(), []
 
-    positive_label = _infer_positive_label(target)
+    positive_label = _resolve_positive_label(target, positive_label)
     positive = target.eq(positive_label)
     usable_mask = target.notna()
     usable_rows = int(usable_mask.sum())
@@ -629,11 +676,12 @@ def _build_target_associations(df, target_col):
         "positive_rows": positive_rows,
         "positive_rate": round(_safe_ratio(positive_rows, usable_rows), 6),
     }
-    if len(unique_values) != 2:
-        return overview, pd.DataFrame(), []
-
     rows = []
     minimum_support = max(10, int(math.ceil(usable_rows * 0.002)))
+    headline_support = max(
+        TARGET_ASSOCIATION_MIN_ROWS,
+        int(math.ceil(usable_rows * TARGET_ASSOCIATION_MIN_SHARE)),
+    )
     for column in df.columns:
         if column == target_col or _is_identifier_like(df[column], column) or _is_datetime_candidate(df[column]):
             continue
@@ -648,21 +696,67 @@ def _build_target_associations(df, target_col):
             if len(grouped) < 2:
                 continue
             effect = float(grouped["mean"].max() - grouped["mean"].min())
+            represented_rows = int(len(frame))
+            represented_positive = int(frame["positive"].sum())
+            coverage_pct = _safe_ratio(represented_rows, usable_rows) * 100
             for level, values in grouped.iterrows():
+                row_count = int(values["count"])
+                target_count = int(values["sum"])
+                target_rate = float(values["mean"])
+                comparison_count = represented_rows - row_count
+                comparison_target_count = represented_positive - target_count
+                comparison_rate = _safe_ratio(comparison_target_count, comparison_count)
+                comparison_difference = target_rate - comparison_rate
+                pooled_rate = _safe_ratio(represented_positive, represented_rows)
+                pooled_standard_error = math.sqrt(
+                    max(
+                        pooled_rate
+                        * (1 - pooled_rate)
+                        * (_safe_ratio(1, row_count) + _safe_ratio(1, comparison_count)),
+                        0.0,
+                    )
+                )
+                p_value = _normal_two_sided_p(
+                    comparison_difference / pooled_standard_error
+                    if pooled_standard_error
+                    else 0.0
+                )
+                difference_standard_error = math.sqrt(
+                    max(
+                        _safe_ratio(target_rate * (1 - target_rate), row_count)
+                        + _safe_ratio(
+                            comparison_rate * (1 - comparison_rate), comparison_count
+                        ),
+                        0.0,
+                    )
+                )
+                rate_ci_lower, rate_ci_upper = _wilson_interval(target_count, row_count)
                 rows.append(
                     {
                         "association_kind": "categorical_rate",
                         "feature": column,
                         "level": level,
-                        "row_count": int(values["count"]),
-                        "target_count": int(values["sum"]),
-                        "target_rate": float(values["mean"]),
+                        "row_count": row_count,
+                        "target_count": target_count,
+                        "comparison_count": comparison_count,
+                        "target_rate": target_rate,
+                        "target_rate_ci_lower": rate_ci_lower,
+                        "target_rate_ci_upper": rate_ci_upper,
+                        "comparison_rate": comparison_rate,
                         "overall_target_rate": _safe_ratio(positive_rows, usable_rows),
-                        "rate_difference": float(values["mean"]) - _safe_ratio(positive_rows, usable_rows),
+                        "rate_difference": target_rate - _safe_ratio(positive_rows, usable_rows),
+                        "comparison_difference": comparison_difference,
+                        "difference_ci_lower": comparison_difference
+                        - 1.96 * difference_standard_error,
+                        "difference_ci_upper": comparison_difference
+                        + 1.96 * difference_standard_error,
                         "group_mean": np.nan,
                         "comparison_mean": np.nan,
                         "signed_effect": np.nan,
                         "effect_size": effect,
+                        "association_effect": abs(comparison_difference),
+                        "coverage_pct": coverage_pct,
+                        "p_value": p_value,
                         "interpretation": "Descriptive association; this does not establish causation.",
                     }
                 )
@@ -683,10 +777,21 @@ def _build_target_associations(df, target_col):
             + (len(comparison_values) - 1) * comparison_values.var()
         ) / max(len(frame) - 2, 1)
         pooled_scale = math.sqrt(pooled_variance) if pooled_variance > 0 else 0.0
+        mean_difference = float(positive_values.mean() - comparison_values.mean())
         signed_effect = (
-            float((positive_values.mean() - comparison_values.mean()) / pooled_scale)
+            float(mean_difference / pooled_scale)
             if pooled_scale
             else 0.0
+        )
+        difference_standard_error = math.sqrt(
+            max(
+                _safe_ratio(float(positive_values.var()), len(positive_values))
+                + _safe_ratio(float(comparison_values.var()), len(comparison_values)),
+                0.0,
+            )
+        )
+        p_value = _normal_two_sided_p(
+            mean_difference / difference_standard_error if difference_standard_error else 0.0
         )
         rows.append(
             {
@@ -695,37 +800,81 @@ def _build_target_associations(df, target_col):
                 "level": f"{positive_label} versus other target rows",
                 "row_count": int(len(frame)),
                 "target_count": int(len(positive_values)),
+                "comparison_count": int(len(comparison_values)),
                 "target_rate": _safe_ratio(len(positive_values), len(frame)),
+                "target_rate_ci_lower": np.nan,
+                "target_rate_ci_upper": np.nan,
+                "comparison_rate": np.nan,
                 "overall_target_rate": _safe_ratio(positive_rows, usable_rows),
                 "rate_difference": np.nan,
+                "comparison_difference": mean_difference,
+                "difference_ci_lower": mean_difference - 1.96 * difference_standard_error,
+                "difference_ci_upper": mean_difference + 1.96 * difference_standard_error,
                 "group_mean": float(positive_values.mean()),
                 "comparison_mean": float(comparison_values.mean()),
                 "signed_effect": signed_effect,
                 "effect_size": abs(signed_effect),
+                "association_effect": abs(signed_effect),
+                "coverage_pct": _safe_ratio(len(frame), usable_rows) * 100,
+                "p_value": p_value,
                 "interpretation": "Standardized descriptive difference; this does not establish causation.",
             }
         )
 
     if not rows:
         return overview, pd.DataFrame(), []
-    associations = pd.DataFrame(rows).sort_values(
-        ["effect_size", "association_kind", "feature", "target_rate"],
-        ascending=[False, True, True, False],
+    associations = pd.DataFrame(rows)
+    associations["adjusted_p_value"] = _benjamini_hochberg(
+        associations["p_value"].tolist()
+    )
+    categorical_mask = associations["association_kind"].eq("categorical_rate")
+    supported = (
+        associations["row_count"].ge(headline_support)
+        & associations["comparison_count"].ge(headline_support)
+        & associations["coverage_pct"].ge(TARGET_ASSOCIATION_MIN_COVERAGE * 100)
+        & associations["adjusted_p_value"].le(TARGET_ASSOCIATION_MAX_ADJUSTED_P)
+    )
+    associations["headline_eligible"] = supported & (
+        (
+            categorical_mask
+            & associations["association_effect"].ge(
+                TARGET_ASSOCIATION_MIN_RATE_DIFFERENCE
+            )
+        )
+        | (
+            ~categorical_mask
+            & associations["association_effect"].ge(TARGET_ASSOCIATION_MIN_NUMERIC_EFFECT)
+        )
+    )
+    associations = associations.sort_values(
+        ["headline_eligible", "association_effect", "row_count", "feature"],
+        ascending=[False, False, False, True],
     ).reset_index(drop=True)
     associations = associations.round(
         {
             "target_rate": 4,
+            "target_rate_ci_lower": 4,
+            "target_rate_ci_upper": 4,
+            "comparison_rate": 4,
             "overall_target_rate": 4,
             "rate_difference": 4,
+            "comparison_difference": 4,
+            "difference_ci_lower": 4,
+            "difference_ci_upper": 4,
             "group_mean": 3,
             "comparison_mean": 3,
             "signed_effect": 3,
             "effect_size": 3,
+            "association_effect": 3,
+            "coverage_pct": 1,
+            "p_value": 6,
+            "adjusted_p_value": 6,
         }
     )
 
     highlights = []
-    categorical_rows = associations[associations["association_kind"] == "categorical_rate"]
+    eligible = associations[associations["headline_eligible"]]
+    categorical_rows = eligible[eligible["association_kind"] == "categorical_rate"]
     if not categorical_rows.empty:
         perfect_levels = categorical_rows[
             categorical_rows["target_rate"].le(0.001)
@@ -739,22 +888,31 @@ def _build_target_associations(df, target_col):
                 f"({float(perfect['target_rate']):.1%}). Investigate this perfect descriptive association "
                 "before relying on it."
             )
-        feature_effects = categorical_rows.groupby("feature")["effect_size"].max().sort_values(ascending=False)
+        feature_effects = (
+            categorical_rows.groupby("feature")["association_effect"]
+            .max()
+            .sort_values(ascending=False)
+        )
         top_feature = feature_effects.index[0]
         top_level = categorical_rows[categorical_rows["feature"] == top_feature].sort_values(
-            ["target_rate", "row_count"], ascending=[False, False]
+            ["association_effect", "row_count"], ascending=[False, False]
         ).iloc[0]
         highlights.append(
             f"{target_col} is associated with {top_feature} in this dataset: {top_level['level']} has "
             f"{int(top_level['target_count']):,} of {int(top_level['row_count']):,} positive rows "
-            f"({float(top_level['target_rate']):.1%}) versus {overview['positive_rate']:.1%} overall. "
+            f"({float(top_level['target_rate']):.1%}, 95% CI "
+            f"{float(top_level['target_rate_ci_lower']):.1%}–"
+            f"{float(top_level['target_rate_ci_upper']):.1%}) versus "
+            f"{overview['positive_rate']:.1%} overall. "
             "This is descriptive, not causal."
         )
-    else:
-        top = associations.iloc[0]
+    elif not eligible.empty:
+        top = eligible.iloc[0]
         highlights.append(
             f"{target_col} is associated with {top['feature']} in this dataset "
-            f"(standardized difference {float(top['signed_effect']):.2f}). This is descriptive, not causal."
+            f"(standardized difference {float(top['signed_effect']):.2f}, 95% difference interval "
+            f"{float(top['difference_ci_lower']):.3g} to "
+            f"{float(top['difference_ci_upper']):.3g}). This is descriptive, not causal."
         )
     return overview, associations, highlights
 
@@ -775,20 +933,24 @@ def _build_responsible_use_notices(df, target_col=None):
     ]
 
 
-def _build_distribution_headline(categorical_summary, total_rows):
+def _build_distribution_headlines(categorical_summary, total_rows):
     if categorical_summary.empty:
-        return None
+        return []
     candidates = categorical_summary[
-        categorical_summary["unique_values"].between(2, 12)
+        categorical_summary["unique_values"].between(2, 20)
         & categorical_summary["top_value_count"].gt(0)
     ]
     if candidates.empty:
-        return None
-    top = candidates.sort_values(["missing_pct", "unique_values", "column"]).iloc[0]
-    return (
-        f"Most common {top['column']} value: {top['top_value']} "
-        f"({int(top['top_value_count']):,} of {total_rows:,} rows, {float(top['top_value_pct']):.1f}%)."
-    )
+        return []
+    ranked = candidates.sort_values(["missing_pct", "unique_values", "column"]).head(2)
+    return [
+        (
+            f"Most common {row.column} value: {row.top_value} "
+            f"({int(row.top_value_count):,} of {total_rows:,} rows, "
+            f"{float(row.top_value_pct):.1f}%)."
+        )
+        for row in ranked.itertuples()
+    ]
 
 
 def _build_multi_value_headlines(summary):
@@ -838,15 +1000,20 @@ def _build_headline_insights(
         f"with {overview['missing_cells']:,} missing cells."
     ]
     if overview["top_missing_column"]:
+        missing_count = int(overview["top_missing_count"])
+        if overview["top_missing_pct"] < 0.05:
+            missing_detail = (
+                f"{missing_count:,} missing value{'s' if missing_count != 1 else ''}; <0.1% missing"
+            )
+        else:
+            missing_detail = f"{overview['top_missing_pct']:.1f}% missing"
         insights.append(
             f"Most incomplete column: {overview['top_missing_column']} "
-            f"({overview['top_missing_pct']:.1f}% missing)."
+            f"({missing_detail})."
         )
     insights.extend(target_highlights[:1])
 
-    distribution = _build_distribution_headline(categorical_summary, overview["rows"])
-    if distribution:
-        insights.append(distribution)
+    insights.extend(_build_distribution_headlines(categorical_summary, overview["rows"]))
     insights.extend(_build_multi_value_headlines(multi_value_summary))
     unit_headline = _build_unit_headline(unit_summary)
     if unit_headline:
@@ -882,10 +1049,18 @@ def _build_data_quality_summary(column_inspection, overview):
             + "."
         )
     if overview["top_missing_column"]:
-        summaries.append(
-            f"The biggest coverage risk is '{overview['top_missing_column']}' at "
-            f"{overview['top_missing_pct']:.1f}% missing."
-        )
+        if overview["top_missing_pct"] < 0.05:
+            missing_count = int(overview["top_missing_count"])
+            summaries.append(
+                f"Highest column missingness is '{overview['top_missing_column']}' at "
+                f"{missing_count:,} value{'s' if missing_count != 1 else ''} (<0.1%); "
+                "the coverage impact is limited."
+            )
+        else:
+            summaries.append(
+                f"The biggest coverage risk is '{overview['top_missing_column']}' at "
+                f"{overview['top_missing_pct']:.1f}% missing."
+            )
     if overview["duplicate_rows"]:
         summaries.append(f"Found {overview['duplicate_rows']:,} exact duplicate row(s).")
     if overview["constant_columns"]:
@@ -959,12 +1134,20 @@ def recommend_analysis_paths(df, target_col=None, analysis_artifacts=None):
         }
     )
 
-    if not target_associations.empty:
-        top_effect = float(target_associations["effect_size"].max())
+    eligible_target_associations = (
+        target_associations[target_associations["headline_eligible"]]
+        if not target_associations.empty and "headline_eligible" in target_associations
+        else pd.DataFrame()
+    )
+    if not eligible_target_associations.empty:
+        top_effect = float(eligible_target_associations["association_effect"].max())
         paths.append(
             {
                 "analysis_type": "Target-aware association analysis",
-                "reason": f"Supported descriptive comparisons are available for {target_col}; wording remains non-causal.",
+                "reason": (
+                    f"Supported descriptive comparisons are available for {target_col}; "
+                    "effect, support, coverage, uncertainty, and adjusted-significance gates apply."
+                ),
                 "score": 85 + min(top_effect * 10, 10),
             }
         )
@@ -1036,7 +1219,119 @@ def recommend_analysis_paths(df, target_col=None, analysis_artifacts=None):
     return recommendations
 
 
-def run_insight_analysis(df, target_col=None):
+def _correlation_reporting(correlations):
+    selection = correlations.attrs.get("column_selection", {})
+    candidate_count = int(selection.get("candidate_columns", 0))
+    analyzed_count = int(selection.get("analyzed_columns", 0))
+    omitted_count = int(selection.get("omitted_columns", 0))
+    selection_text = (
+        f" At most {MAX_CORRELATION_COLUMNS} numeric columns are selected deterministically by "
+        "coverage, uniqueness, and column name"
+    )
+    if candidate_count:
+        selection_text += (
+            f"; this dataset analyzed {analyzed_count} of {candidate_count} candidate columns"
+        )
+    selection_text += "."
+    methodology = (
+        f"Pearson correlations use at most {MAX_ANALYSIS_ROWS:,} deterministic rows.{selection_text} "
+        f"Headlines require paired n >= {CORRELATION_MIN_PAIRED_ROWS}, coverage >= "
+        f"{CORRELATION_MIN_COVERAGE:.0%}, |r| >= {CORRELATION_MIN_EFFECT:.2f}, and "
+        f"Benjamini-Hochberg adjusted p <= {CORRELATION_MAX_ADJUSTED_P:.2f}."
+    )
+    warnings_list = []
+    if omitted_count:
+        warnings_list.append(
+            f"Correlation screening analyzed {analyzed_count} of {candidate_count} eligible "
+            f"numeric columns and omitted {omitted_count} to keep pairwise work bounded."
+        )
+    return methodology, warnings_list, selection
+
+
+def _target_association_methodology(usable_rows):
+    headline_support = max(
+        TARGET_ASSOCIATION_MIN_ROWS,
+        int(math.ceil((usable_rows or 0) * TARGET_ASSOCIATION_MIN_SHARE)),
+    )
+    return (
+        "Target-aware rows remain available as technical evidence. Headlines require at least "
+        f"{headline_support:,} rows in both comparison sides, at least "
+        f"{TARGET_ASSOCIATION_MIN_COVERAGE:.0%} feature coverage, Benjamini-Hochberg adjusted "
+        f"p <= {TARGET_ASSOCIATION_MAX_ADJUSTED_P:.2f}, and either a class-rate difference >= "
+        f"{TARGET_ASSOCIATION_MIN_RATE_DIFFERENCE:.0%} or an absolute standardized numeric "
+        f"difference >= {TARGET_ASSOCIATION_MIN_NUMERIC_EFFECT:.2f}. Proportion intervals are "
+        "95% Wilson intervals; difference intervals use a 95% normal approximation."
+    )
+
+
+def retarget_insight_analysis(df, analysis, target_col, positive_label=None):
+    """Refresh only artifacts whose meaning depends on target semantics."""
+
+    updated = dict(analysis)
+    association_target, target_was_inferred = _infer_association_target(df, target_col)
+    group_summary = _build_group_summary(df, target_col=association_target)
+    target_overview, target_associations, target_highlights = (
+        _build_target_associations(df, association_target, positive_label=positive_label)
+        if association_target
+        else (None, pd.DataFrame(), [])
+    )
+    responsible_use_notices = _build_responsible_use_notices(df, association_target)
+    artifacts = {
+        "correlations": updated.get("correlations", pd.DataFrame()),
+        "group_summary": group_summary,
+        "trend_summary": updated.get("trend_summary"),
+        "anomaly_summary": updated.get("anomaly_summary", pd.DataFrame()),
+        "multi_value_summary": updated.get("multi_value_summary", pd.DataFrame()),
+        "unit_summary": updated.get("unit_summary", pd.DataFrame()),
+        "target_associations": target_associations,
+    }
+    analysis_recommendations = recommend_analysis_paths(
+        df, target_col=association_target, analysis_artifacts=artifacts
+    )
+    headlines = _build_headline_insights(
+        updated["overview"],
+        updated.get("categorical_summary", pd.DataFrame()),
+        artifacts["correlations"],
+        group_summary,
+        artifacts["trend_summary"],
+        artifacts["anomaly_summary"],
+        artifacts["multi_value_summary"],
+        artifacts["unit_summary"],
+        target_highlights,
+    )
+    updated.update(
+        {
+            "analysis_recommendations": analysis_recommendations,
+            "group_summary": group_summary,
+            "target_overview": target_overview,
+            "target_associations": target_associations,
+            "target_association_highlights": target_highlights,
+            "target_association_warnings": [
+                message
+                for message in target_highlights
+                if message.startswith("Potential leakage")
+            ],
+            "target_association_methodology": _target_association_methodology(
+                target_overview.get("usable_rows", 0) if target_overview else 0
+            ),
+            "association_target": association_target,
+            "association_target_inferred": target_was_inferred,
+            "responsible_use_notices": responsible_use_notices,
+            "responsible_use_notes": responsible_use_notices,
+            "grouping_highlight": _build_grouping_highlight(group_summary),
+            "best_analysis_path": (
+                analysis_recommendations.iloc[0].to_dict()
+                if not analysis_recommendations.empty
+                else None
+            ),
+            "headlines": headlines,
+            "selected_target": target_col,
+        }
+    )
+    return updated
+
+
+def run_insight_analysis(df, target_col=None, positive_label=None):
     overview = {
         "rows": int(df.shape[0]),
         "columns": int(df.shape[1]),
@@ -1045,12 +1340,14 @@ def run_insight_analysis(df, target_col=None):
         "duplicate_rows": int(df.duplicated().sum()) if len(df.columns) else 0,
         "constant_columns": int(sum(df[column].nunique(dropna=True) <= 1 for column in df.columns)),
         "top_missing_column": None,
+        "top_missing_count": 0,
         "top_missing_pct": 0.0,
     }
     if not df.empty:
         missing_pct = (df.isna().mean() * 100).sort_values(ascending=False)
         if not missing_pct.empty and missing_pct.iloc[0] > 0:
             overview["top_missing_column"] = missing_pct.index[0]
+            overview["top_missing_count"] = int(df[missing_pct.index[0]].isna().sum())
             overview["top_missing_pct"] = float(missing_pct.iloc[0])
 
     association_target, target_was_inferred = _infer_association_target(df, target_col)
@@ -1063,9 +1360,11 @@ def run_insight_analysis(df, target_col=None):
     anomaly_summary = _build_anomaly_summary(df)
     multi_value_summary = _build_multi_value_summary(df)
     unit_summary = _build_unit_summary(df)
-    target_overview, target_associations, target_highlights = _build_target_associations(
-        df, association_target
-    ) if association_target else (None, pd.DataFrame(), [])
+    target_overview, target_associations, target_highlights = (
+        _build_target_associations(df, association_target, positive_label=positive_label)
+        if association_target
+        else (None, pd.DataFrame(), [])
+    )
     responsible_use_notices = _build_responsible_use_notices(df, association_target)
 
     artifacts = {
@@ -1095,6 +1394,10 @@ def run_insight_analysis(df, target_col=None):
         target_highlights,
     )
 
+    correlation_methodology, correlation_warnings, correlation_selection = (
+        _correlation_reporting(correlations)
+    )
+
     return {
         "overview": overview,
         "column_inspection": column_inspection,
@@ -1102,12 +1405,9 @@ def run_insight_analysis(df, target_col=None):
         "numeric_summary": numeric_summary,
         "categorical_summary": categorical_summary,
         "correlations": correlations,
-        "correlation_methodology": (
-            f"Pearson correlations use at most {MAX_ANALYSIS_ROWS:,} deterministic rows. Headlines require "
-            f"paired n >= {CORRELATION_MIN_PAIRED_ROWS}, coverage >= {CORRELATION_MIN_COVERAGE:.0%}, "
-            f"|r| >= {CORRELATION_MIN_EFFECT:.2f}, and Benjamini-Hochberg adjusted p <= "
-            f"{CORRELATION_MAX_ADJUSTED_P:.2f}."
-        ),
+        "correlation_methodology": correlation_methodology,
+        "correlation_warnings": correlation_warnings,
+        "correlation_column_selection": correlation_selection,
         "group_summary": group_summary,
         "trend_summary": trend_summary,
         "anomaly_summary": anomaly_summary,
@@ -1123,6 +1423,9 @@ def run_insight_analysis(df, target_col=None):
         "target_association_warnings": [
             message for message in target_highlights if message.startswith("Potential leakage")
         ],
+        "target_association_methodology": _target_association_methodology(
+            target_overview.get("usable_rows", 0) if target_overview else 0
+        ),
         "association_target": association_target,
         "association_target_inferred": target_was_inferred,
         "responsible_use_notices": responsible_use_notices,

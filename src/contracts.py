@@ -141,6 +141,9 @@ class ScoringResult:
     drift_summary: dict[str, Any] = field(default_factory=dict)
     external_metrics: dict[str, Any] | None = None
     readiness: dict[str, Any] = field(default_factory=dict)
+    evaluation_status: Literal["not_requested", "completed", "blocked"] = "not_requested"
+    prediction_column: str | None = None
+    probability_columns: dict[str, str] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -149,4 +152,7 @@ class ScoringResult:
             "drift_summary": self.drift_summary,
             "external_metrics": self.external_metrics,
             "readiness": self.readiness,
+            "evaluation_status": self.evaluation_status,
+            "prediction_column": self.prediction_column,
+            "probability_columns": self.probability_columns,
         }

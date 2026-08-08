@@ -27,8 +27,9 @@ from src.heuristics import (
 from src.heuristics import (
     tokenize_column_name as _tokenize_column_name,
 )
-from src.insights import run_insight_analysis
+from src.insights import retarget_insight_analysis, run_insight_analysis
 from src.modeling import train_model
+from src.profiling import sanitize_for_profile
 
 MAX_PREVIEW_ROWS = 25
 MAX_CHART_ROWS = 5000
@@ -143,29 +144,9 @@ def _collect_assistant_extensions(
 
 
 def sanitize_dataframe(df):
-    cleaned = df.copy()
-    cleaned.columns = [str(column).strip() for column in cleaned.columns]
-    duplicates = (
-        pd.Index(cleaned.columns)[pd.Index(cleaned.columns).duplicated()].unique().tolist()
-    )
-    if duplicates:
-        raise ValueError(
-            "Column names must be unique after trimming whitespace. Duplicate columns: "
-            + ", ".join(duplicates[:5])
-        )
-    cleaned = cleaned.replace([np.inf, -np.inf], np.nan)
+    """Compatibility wrapper around the train/holdout-safe profile sanitizer."""
 
-    for column in cleaned.columns:
-        series = normalize_missing_tokens(cleaned[column])
-        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
-            cleaned[column] = series
-            numeric_candidate = pd.to_numeric(series, errors="coerce")
-            if numeric_candidate.notna().mean() >= 0.95 and numeric_candidate.notna().sum() > 0:
-                cleaned[column] = numeric_candidate
-        else:
-            cleaned[column] = series
-
-    return cleaned
+    return sanitize_for_profile(pd.DataFrame(df))
 
 
 def sanitize_target_series(series):
@@ -173,9 +154,6 @@ def sanitize_target_series(series):
 
     if pd.api.types.is_object_dtype(target) or pd.api.types.is_string_dtype(target):
         target = target.astype("string").str.strip()
-        numeric_candidate = pd.to_numeric(target, errors="coerce")
-        if numeric_candidate.notna().mean() >= 0.95 and numeric_candidate.notna().sum() > 0:
-            target = numeric_candidate
 
     return target
 
@@ -1291,8 +1269,30 @@ def run_analysis(
         top_n=min(8, len(sanitized_df.columns)),
         extension_registry=extension_registry,
     )
-    insight_analysis = dataset_recommendation["insight_analysis"]
-    insight_analysis["selected_target"] = selected_target
+    insight_analysis = dict(dataset_recommendation["insight_analysis"])
+    current_target = insight_analysis.get("association_target")
+    current_positive_label = (insight_analysis.get("target_overview") or {}).get(
+        "positive_label"
+    )
+    positive_label_changed = (
+        positive_label is not None and positive_label != current_positive_label
+    )
+    if selected_target and (
+        current_target != selected_target or positive_label_changed
+    ):
+        insight_analysis = retarget_insight_analysis(
+            sanitized_df,
+            insight_analysis,
+            selected_target,
+            positive_label=positive_label,
+        )
+    else:
+        insight_analysis["selected_target"] = selected_target
+    dataset_recommendation = dict(dataset_recommendation)
+    dataset_recommendation["insight_analysis"] = insight_analysis
+    dataset_recommendation["best_analysis_path"] = insight_analysis.get(
+        "best_analysis_path"
+    )
 
     if not selected_target:
         result = _build_analysis_result(
@@ -1383,7 +1383,12 @@ def run_analysis(
     problem_type = detect_problem_type(y) if problem_type_mode == "Auto Detect" else problem_type_mode.lower()
     target_style = summarize_target_style(y, problem_type)
 
-    sampled_X, sampled_y, sampled = sample_training_data(X, y, problem_type)
+    sampled_X, sampled_y, sampled = sample_training_data(
+        X,
+        y,
+        problem_type,
+        random_state=random_state,
+    )
     sampled_y.name = selected_target
     sampled_numeric = [col for col in prepared["numeric_cols"] if col in sampled_X.columns]
     sampled_categorical = [col for col in prepared["categorical_cols"] if col in sampled_X.columns]
@@ -1405,10 +1410,29 @@ def run_analysis(
         sampled_categorical,
         **training_kwargs,
     )
+    trained_positive_label = trained.get("positive_label")
+    insight_positive_label = (insight_analysis.get("target_overview") or {}).get(
+        "positive_label"
+    )
+    if (
+        problem_type == "classification"
+        and trained_positive_label != insight_positive_label
+    ):
+        insight_analysis = retarget_insight_analysis(
+            sanitized_df,
+            insight_analysis,
+            selected_target,
+            positive_label=trained_positive_label,
+        )
+        dataset_recommendation["insight_analysis"] = insight_analysis
+        dataset_recommendation["best_analysis_path"] = insight_analysis.get(
+            "best_analysis_path"
+        )
     if trained.get("model_bundle") is not None:
+        reference_columns = trained["model_bundle"].identifier_reference
         trained["model_bundle"].identifier_reference = {
             column: set(X[column].dropna().tolist())
-            for column in trained["model_bundle"].optional_identifier_columns
+            for column in reference_columns
             if column in X.columns
         }
 
@@ -1428,7 +1452,7 @@ def run_analysis(
             0,
             f"Removed {late_drops} additional target rows during final validation before model fitting.",
         )
-    if trained["imbalance_ratio"] is not None and trained["imbalance_ratio"] < 0.1:
+    if trained.get("selection_metric") == "average_precision":
         notes.insert(
             0,
             f"Detected an imbalanced classification target (minority class share {trained['imbalance_ratio']:.3%}); ranking models by average precision.",

@@ -24,6 +24,14 @@ def test_fixture_manifest_locks_hash_source_license_schema_and_expected_facts():
         assert len(content) == fixture["byte_size"]
         assert fixture["source"]["url"].startswith("https://www.kaggle.com/datasets/")
         assert fixture["license"]["spdx"] in {"CC0-1.0", "GPL-2.0-only"}
+        license_text = (PROJECT_ROOT / fixture["license"]["text_path"]).read_text(
+            encoding="utf-8"
+        )
+        expected_license_heading = {
+            "CC0-1.0": "CC0 1.0 Universal",
+            "GPL-2.0-only": "GNU GENERAL PUBLIC LICENSE",
+        }[fixture["license"]["spdx"]]
+        assert expected_license_heading in license_text
         assert list(frame.columns) == fixture["schema"]["columns"]
         assert frame.shape == (
             fixture["expected_facts"]["row_count"],

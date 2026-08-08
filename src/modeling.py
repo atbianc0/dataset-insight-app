@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import warnings
 from collections.abc import Iterable
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -51,9 +52,23 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
 
 from src.contracts import AnalysisConfig, ModelBundle
+from src.heuristics import infer_binary_positive_label
 
 MISSING_TOKENS = {"", "na", "n/a", "nan", "none", "null", "unknown", "?", "-", "--"}
 HIGH_CARDINALITY_LIMIT = 80
+DERIVED_OUTCOME_TOKENS = {
+    "after",
+    "derived",
+    "final",
+    "outcome",
+    "predicted",
+    "prediction",
+    "probability",
+    "reason",
+    "result",
+    "score",
+    "status",
+}
 
 
 def dtype_family(series: pd.Series) -> str:
@@ -97,8 +112,12 @@ def is_identifier_column(series: pd.Series, name: str) -> bool:
     values = _normalise_missing(series).dropna()
     if values.empty:
         return False
-    unique_ratio = float(values.nunique(dropna=True) / len(values))
-    if _has_identifier_token(name) and unique_ratio > 0.75:
+    unique_count = int(values.nunique(dropna=True))
+    unique_ratio = float(unique_count / len(values))
+    # An explicit id token is semantic evidence even when an entity appears on
+    # several rows. Requiring near-uniqueness lets repeated customer/account IDs
+    # enter a random split and allows the model to memorize entity outcomes.
+    if _has_identifier_token(name) and unique_count > 1:
         return True
     if dtype_family(values) == "numeric" and unique_ratio > 0.995 and len(values) > 25:
         numeric = pd.to_numeric(values, errors="coerce").sort_values()
@@ -182,13 +201,48 @@ def detect_leakage(
 
         column_tokens = set(_name_tokens(column))
         if target_tokens and target_tokens & column_tokens and column_tokens & {
-            "after", "final", "outcome", "reason", "result", "status"
+            "after",
+            "final",
+            "outcome",
+            "reason",
+            "result",
+            "status",
         }:
             excluded.add(column)
             warnings_found.append(
                 f"Excluded {column}: its name suggests it may be recorded after the outcome."
             )
             continue
+
+        if problem_type == "classification" and _numeric_ratio(series) >= 0.95:
+            paired = pd.DataFrame(
+                {
+                    "feature": pd.to_numeric(_normalise_missing(series), errors="coerce"),
+                    "target": _normalise_missing(y),
+                }
+            ).dropna()
+            if len(paired) >= 20 and paired["target"].nunique(dropna=True) == 2:
+                encoded_target = pd.Series(
+                    pd.factorize(paired["target"], sort=True)[0],
+                    index=paired.index,
+                )
+                auc = float(roc_auc_score(encoded_target, paired["feature"]))
+                separation = max(auc, 1.0 - auc)
+                if separation >= 0.999:
+                    suspicious_name = bool(
+                        (target_tokens and target_tokens & column_tokens)
+                        or column_tokens & DERIVED_OUTCOME_TOKENS
+                    )
+                    message = (
+                        f"{column} is a near-deterministic separator of the selected target "
+                        f"(absolute AUC {separation:.4f}); review it as possible target leakage."
+                    )
+                    warnings_found.append(
+                        f"Excluded {message}" if suspicious_name else f"Review {message}"
+                    )
+                    if suspicious_name:
+                        excluded.add(column)
+                        continue
 
         if _looks_datetime(series):
             with warnings.catch_warnings():
@@ -281,6 +335,7 @@ class RawFeatureTransformer(BaseEstimator, TransformerMixin):
         self.input_columns_ = frame.columns.tolist()
         self.input_schema_ = {column: dtype_family(frame[column]) for column in frame.columns}
         self.identifier_columns_ = []
+        self.detected_identifier_columns_ = []
         self.dropped_columns_ = []
         self.leakage_warnings_ = leakage_warnings
         self.specs_: list[dict[str, Any]] = []
@@ -296,10 +351,16 @@ class RawFeatureTransformer(BaseEstimator, TransformerMixin):
             if series.nunique(dropna=True) <= 1:
                 self.dropped_columns_.append((column, "constant in training rows"))
                 continue
-            if self.drop_identifier_columns and is_identifier_column(series, column):
-                self.identifier_columns_.append(column)
-                self.dropped_columns_.append((column, "identifier-like"))
-                continue
+            if is_identifier_column(series, column):
+                self.detected_identifier_columns_.append(column)
+                if self.drop_identifier_columns:
+                    self.identifier_columns_.append(column)
+                    self.dropped_columns_.append((column, "identifier-like"))
+                    continue
+                self.leakage_warnings_.append(
+                    f"Included identifier-like column {column} because identifier exclusion was "
+                    "disabled. Entity overlap will still be tracked, and validation may be optimistic."
+                )
 
             if _looks_datetime(series):
                 self.specs_.append(
@@ -391,6 +452,19 @@ class RawFeatureTransformer(BaseEstimator, TransformerMixin):
                 )
             else:
                 self.specs_.append({"source": column, "kind": "categorical", "outputs": [column]})
+
+        used_outputs: set[str] = set()
+        for spec in self.specs_:
+            resolved_outputs = []
+            for output in spec["outputs"]:
+                candidate = output
+                suffix = 2
+                while candidate in used_outputs:
+                    candidate = f"{output}__{suffix}"
+                    suffix += 1
+                used_outputs.add(candidate)
+                resolved_outputs.append(candidate)
+            spec["outputs"] = resolved_outputs
 
         self.required_source_columns_ = list(dict.fromkeys(spec["source"] for spec in self.specs_))
         self.output_columns_ = [output for spec in self.specs_ for output in spec["outputs"]]
@@ -571,7 +645,11 @@ def normalise_target(y: pd.Series, problem_type: str) -> pd.Series:
         return pd.to_numeric(series, errors="coerce").dropna().astype(float)
     if pd.api.types.is_bool_dtype(series):
         return series.astype(bool)
-    if _numeric_ratio(series) >= 0.95:
+    # Classification labels use their declared dtype, not a value-dependent
+    # whole-dataset conversion threshold. A string label remains a string even
+    # if most values happen to look numeric, so a holdout-only label cannot
+    # change training-label semantics or trigger a nullable integer cast.
+    if pd.api.types.is_numeric_dtype(series):
         numeric = pd.to_numeric(series, errors="coerce")
         if np.allclose(numeric, np.round(numeric), equal_nan=True):
             return numeric.astype(int)
@@ -580,22 +658,14 @@ def normalise_target(y: pd.Series, problem_type: str) -> pd.Series:
 
 
 def infer_positive_label(labels: list[Any], y_train: pd.Series, requested: Any | None = None) -> Any | None:
-    if len(labels) != 2:
-        if requested is not None:
-            raise ValueError("A positive label override is only valid for binary classification.")
-        return None
-    if requested is not None:
-        for label in labels:
-            if label == requested or str(label) == str(requested):
-                return label
-        raise ValueError(f"Positive label {requested!r} is not present in the training target.")
-
-    preferred = {"1", "true", "yes", "y", "positive", "churn", "churned", "failed", "fraud", "default"}
-    for label in labels:
-        if str(label).strip().lower() in preferred:
-            return label
-    counts = y_train.value_counts(dropna=False)
-    return counts.idxmin()
+    try:
+        return infer_binary_positive_label(y_train, requested, labels=labels)
+    except ValueError as exc:
+        if "not present" in str(exc):
+            raise ValueError(
+                f"Positive label {requested!r} is not present in the training target."
+            ) from exc
+        raise
 
 
 def classification_metrics(
@@ -678,6 +748,30 @@ def baseline_predictions(bundle: ModelBundle, row_count: int) -> tuple[np.ndarra
     return np.full(row_count, float(strategy["mean"]), dtype=float), None
 
 
+def _entity_overlap_warnings(
+    training: pd.DataFrame,
+    holdout: pd.DataFrame,
+) -> list[str]:
+    """Describe identifier-token entities shared by train and holdout rows."""
+
+    warnings_found: list[str] = []
+    for column in training.columns.intersection(holdout.columns):
+        if not _has_identifier_token(column):
+            continue
+        training_values = set(_normalise_missing(training[column]).dropna().tolist())
+        if not training_values:
+            continue
+        holdout_values = _normalise_missing(holdout[column])
+        overlap = int(holdout_values.notna().mul(holdout_values.isin(training_values)).sum())
+        if overlap:
+            warnings_found.append(
+                f"Entity overlap: {overlap:,} of {len(holdout):,} holdout rows share {column} "
+                "with model-training rows. Random-holdout performance may be optimistic; use "
+                "grouped or future-period validation when entities repeat."
+            )
+    return warnings_found
+
+
 def _training_reference(frame: pd.DataFrame, required_columns: list[str]) -> dict[str, Any]:
     reference: dict[str, Any] = {}
     for column in required_columns:
@@ -757,6 +851,22 @@ def _raw_permutation_importance(
     )
 
 
+def _binary_average_precision_scorer(
+    estimator: Pipeline,
+    features: pd.DataFrame,
+    target: pd.Series,
+    *,
+    positive_label: Any,
+) -> float:
+    """Score the requested positive class without assuming it is encoded as 1."""
+
+    probabilities = estimator.predict_proba(features)
+    labels = estimator.named_steps["model"].classes_.tolist()
+    positive_index = labels.index(positive_label)
+    binary_target = pd.Series(target).reset_index(drop=True).eq(positive_label).astype(int)
+    return float(average_precision_score(binary_target, probabilities[:, positive_index]))
+
+
 def train_model(
     X: pd.DataFrame,
     y: pd.Series,
@@ -790,17 +900,33 @@ def train_model(
         stratify=stratify,
     )
 
+    class_labels: list[Any] = []
+    positive_label: Any | None = None
+    negative_label: Any | None = None
+    threshold: float | None = None
     if problem_type == "classification":
+        class_labels = pd.Index(y_train.unique()).sort_values().tolist()
+        positive_label = infer_positive_label(class_labels, y_train, config.positive_label)
         minimum_class = int(y_train.value_counts().min())
         requested_folds = 3 if config.effort == "standard" else 5
         folds = min(requested_folds, minimum_class)
         if folds < 2:
             raise ValueError("Each target class needs at least two training rows for cross-validation.")
         splitter: Any = StratifiedKFold(n_splits=folds, shuffle=True, random_state=config.random_seed)
-        selection_scoring = "f1_macro"
+        minority_share = float(y_train.value_counts(normalize=True).min())
+        if len(class_labels) == 2 and minority_share < 0.2:
+            selection_metric = "average_precision"
+            selection_scoring: Any = partial(
+                _binary_average_precision_scorer,
+                positive_label=positive_label,
+            )
+        else:
+            selection_metric = "f1_macro"
+            selection_scoring = "f1_macro"
     else:
         folds = min(3 if config.effort == "standard" else 5, max(2, len(y_train) // 10))
         splitter = KFold(n_splits=folds, shuffle=True, random_state=config.random_seed)
+        selection_metric = "rmse"
         selection_scoring = "neg_root_mean_squared_error"
 
     candidates = _candidate_models(problem_type, config.effort, config.random_seed)
@@ -825,7 +951,7 @@ def train_model(
         )
         display_scores = -scores if problem_type == "regression" else scores
         cv_results[name] = {
-            "selection_metric": "rmse" if problem_type == "regression" else "f1_macro",
+            "selection_metric": selection_metric,
             "cv_mean": float(display_scores.mean()),
             "cv_std": float(display_scores.std(ddof=0)),
             "cv_scores": [float(value) for value in display_scores],
@@ -839,16 +965,9 @@ def train_model(
         best_name = min(cv_results, key=lambda name: cv_results[name]["cv_mean"])
     best_pipeline = fitted_specs[best_name]
 
-    class_labels: list[Any] = []
-    positive_label: Any | None = None
-    negative_label: Any | None = None
-    threshold: float | None = None
     if problem_type == "classification":
-        class_labels = pd.Index(y_train.unique()).sort_values().tolist()
-        positive_label = infer_positive_label(class_labels, y_train, config.positive_label)
         if len(class_labels) == 2:
             negative_label = next(label for label in class_labels if label != positive_label)
-            minority_share = float(y_train.value_counts(normalize=True).min())
             if minority_share < 0.2:
                 oof_probabilities = cross_val_predict(
                     clone(best_pipeline),
@@ -927,8 +1046,17 @@ def train_model(
     feature_names = _transformed_feature_names(best_pipeline)
     required_columns = raw_transformer.required_source_columns_
     identifier_columns = raw_transformer.identifier_columns_
+    detected_identifier_columns = raw_transformer.detected_identifier_columns_
+    leakage_warnings = list(
+        dict.fromkeys(
+            [
+                *raw_transformer.leakage_warnings_,
+                *_entity_overlap_warnings(X_train, X_holdout),
+            ]
+        )
+    )
     identifier_reference = {
-        column: set(frame[column].dropna().tolist()) for column in identifier_columns
+        column: set(frame[column].dropna().tolist()) for column in detected_identifier_columns
     }
     bundle = ModelBundle(
         pipeline=best_pipeline,
@@ -949,7 +1077,7 @@ def train_model(
         primary_metric=primary_metric,
         training_reference=_training_reference(X_train, required_columns),
         identifier_reference=identifier_reference,
-        leakage_warnings=raw_transformer.leakage_warnings_,
+        leakage_warnings=leakage_warnings,
         training_rows=len(X_train),
         holdout_rows=len(X_holdout),
         random_seed=config.random_seed,
@@ -960,7 +1088,7 @@ def train_model(
     )
     result_metrics = {
         name: {
-            ("rmse" if problem_type == "regression" else "f1_macro"): values["cv_mean"],
+            values["selection_metric"]: values["cv_mean"],
             "cv_std": values["cv_std"],
         }
         for name, values in cv_results.items()
@@ -983,9 +1111,10 @@ def train_model(
         "imbalance_ratio": float(class_distribution.min()) if problem_type == "classification" else None,
         "positive_label": positive_label,
         "decision_threshold": threshold,
+        "selection_metric": selection_metric,
         "feature_names": feature_names,
         "feature_importance": feature_importance,
-        "leakage_warnings": raw_transformer.leakage_warnings_,
+        "leakage_warnings": leakage_warnings,
         "dropped_columns": raw_transformer.dropped_columns_,
         "dropped_target_rows": {"before_split": int((~valid).sum()), "train_split": 0, "test_split": 0},
     }

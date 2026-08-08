@@ -47,7 +47,12 @@ def _name_tokens(name: str) -> set[str]:
 
 
 def sanitize_for_profile(frame: pd.DataFrame) -> pd.DataFrame:
-    """Normalize a raw table without silently discarding columns."""
+    """Normalize missing values without learning types from the full dataset.
+
+    Numeric-string, datetime, and other learned conversions deliberately stay in
+    the fitted modeling pipeline.  Deciding those types here would let the final
+    holdout influence the feature schema before the train/holdout split.
+    """
 
     if not isinstance(frame, pd.DataFrame):
         raise TypeError("Dataset profiling requires a pandas DataFrame.")
@@ -68,12 +73,7 @@ def sanitize_for_profile(frame: pd.DataFrame) -> pd.DataFrame:
     cleaned = cleaned.replace([np.inf, -np.inf], np.nan)
 
     for column in cleaned.columns:
-        series = normalize_missing_tokens(cleaned[column])
-        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
-            numeric = pd.to_numeric(series, errors="coerce")
-            if numeric.notna().any() and numeric.notna().mean() >= 0.95:
-                series = numeric
-        cleaned[column] = series
+        cleaned[column] = normalize_missing_tokens(cleaned[column])
     return cleaned
 
 

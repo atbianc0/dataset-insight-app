@@ -1,9 +1,10 @@
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from src.insights import run_insight_analysis
+from src.insights import MAX_CORRELATION_COLUMNS, run_insight_analysis
 
 SAMPLE_DATA = Path(__file__).resolve().parents[1] / "sample_data"
 
@@ -57,6 +58,29 @@ def test_independent_noise_is_not_promoted_as_a_relationship():
     assert not result["correlations"]["headline_eligible"].any()
     assert not any("Supported numeric association" in text for text in result["headlines"])
     assert "Correlation analysis" not in result["analysis_recommendations"]["analysis_type"].tolist()
+
+
+def test_wide_correlation_screening_is_deterministically_bounded():
+    rng = np.random.default_rng(8)
+    column_count = 300
+    frame = pd.DataFrame(
+        rng.normal(size=(200, column_count)),
+        columns=[f"measure_{index:03d}" for index in range(column_count)],
+    )
+
+    started = time.perf_counter()
+    result = run_insight_analysis(frame)
+    elapsed = time.perf_counter() - started
+    selection = result["correlation_column_selection"]
+
+    assert selection == {
+        "candidate_columns": column_count,
+        "analyzed_columns": MAX_CORRELATION_COLUMNS,
+        "omitted_columns": column_count - MAX_CORRELATION_COLUMNS,
+    }
+    assert result["correlation_warnings"]
+    assert f"At most {MAX_CORRELATION_COLUMNS}" in result["correlation_methodology"]
+    assert elapsed < 5
 
 
 def test_anomalies_are_not_forced_when_no_row_crosses_the_threshold():
@@ -144,12 +168,53 @@ def test_target_associations_use_counts_noncausal_wording_and_responsible_use_no
     assert monthly["row_count"] == 40
     assert monthly["target_count"] == 40
     assert monthly["target_rate"] == 1.0
+    assert bool(monthly["headline_eligible"]) is True
+    assert monthly["target_rate_ci_lower"] < monthly["target_rate_ci_upper"]
+    assert monthly["difference_ci_lower"] > 0
+    assert monthly["adjusted_p_value"] <= 0.05
     assert "Potential leakage or distribution-shift warning" in result["target_association_warnings"][0]
     assert "not causal" in " ".join(result["target_association_highlights"]).lower()
     notice = result["responsible_use_notes"][0]
     assert "Age" in notice and "Gender" in notice
     assert "fairness" in notice
     assert result["best_analysis_path"]["analysis_type"] == "Target-aware association analysis"
+
+
+def test_target_noise_and_rare_perfect_groups_stay_in_technical_evidence():
+    rng = np.random.default_rng(20260807)
+    rows = 4_000
+    noise = pd.DataFrame(
+        {
+            "segment": rng.choice(list("ABCDE"), rows),
+            "region": rng.choice(["north", "south", "east", "west"], rows),
+            "measure": rng.normal(size=rows),
+            "Churn": rng.integers(0, 2, rows),
+        }
+    )
+
+    noise_result = run_insight_analysis(noise)
+
+    assert not noise_result["target_associations"].empty
+    assert not noise_result["target_associations"]["headline_eligible"].any()
+    assert not noise_result["target_association_highlights"]
+    assert "Target-aware association analysis" not in noise_result[
+        "analysis_recommendations"
+    ]["analysis_type"].tolist()
+    assert not any("Churn is associated" in item for item in noise_result["headlines"])
+
+    rare = pd.DataFrame(
+        {
+            "segment": ["rare"] * 10 + ["A"] * 495 + ["B"] * 495,
+            "Churn": [1] * 10 + ([0, 1] * 247 + [0]) + ([0, 1] * 247 + [1]),
+        }
+    )
+    rare_result = run_insight_analysis(rare)
+    rare_row = _row(rare_result["target_associations"], level="rare")
+
+    assert rare_row["target_rate"] == 1.0
+    assert rare_row["row_count"] == 10
+    assert bool(rare_row["headline_eligible"]) is False
+    assert not rare_result["target_association_warnings"]
 
 
 def test_pandas_string_target_and_category_dtypes_are_supported():
@@ -167,6 +232,23 @@ def test_pandas_string_target_and_category_dtypes_are_supported():
     assert result["target_overview"]["positive_rows"] == 20
     assert set(result["target_associations"]["feature"]) == {"segment", "spend"}
     assert result["association_target_inferred"] is False
+
+
+def test_multiclass_target_does_not_invent_a_binary_positive_class():
+    frame = pd.DataFrame(
+        {
+            "segment": ["A", "B", "C"] * 40,
+            "measure": np.linspace(0, 1, 120),
+            "Outcome": pd.Series(["low", "medium", "high"] * 40, dtype="string"),
+        }
+    )
+
+    result = run_insight_analysis(frame, target_col="Outcome")
+
+    assert result["association_target"] == "Outcome"
+    assert result["target_overview"] is None
+    assert result["target_associations"].empty
+    assert not result["target_association_highlights"]
 
 
 def test_group_comparison_does_not_claim_meaning_or_significance():
@@ -192,6 +274,7 @@ def test_netflix_fixture_surfaces_exact_and_format_aware_facts_without_a_false_t
 
     result = run_insight_analysis(frame)
     type_summary = _row(result["categorical_summary"], column="type")
+    rating_summary = _row(result["categorical_summary"], column="rating")
     top_country = _row(result["multi_value_summary"], column="country", value="United States")
     top_genre = _row(
         result["multi_value_summary"], column="listed_in", value="International Movies"
@@ -207,6 +290,9 @@ def test_netflix_fixture_surfaces_exact_and_format_aware_facts_without_a_false_t
     assert type_summary["top_value"] == "Movie"
     assert type_summary["top_value_count"] == 6_131
     assert "TV Show (2,676)" in type_summary["top_values"]
+    assert rating_summary["top_value"] == "TV-MA"
+    assert rating_summary["top_value_count"] == 3_207
+    assert any("Most common rating value: TV-MA (3,207" in item for item in result["headlines"])
     assert top_country["row_count"] == 3_690
     assert top_genre["row_count"] == 2_752
     assert minutes["row_count"] == 6_128 and minutes["median"] == 98
@@ -231,6 +317,7 @@ def test_churn_training_fixture_reports_exact_target_support_and_perfect_monthly
     assert result["overview"]["rows"] == 440_833
     assert result["overview"]["columns"] == 12
     assert result["overview"]["missing_cells"] == 12
+    assert result["overview"]["top_missing_count"] == 1
     assert result["target_overview"]["usable_rows"] == 440_832
     assert result["target_overview"]["missing_rows"] == 1
     assert result["target_overview"]["positive_rows"] == 249_999
@@ -241,6 +328,8 @@ def test_churn_training_fixture_reports_exact_target_support_and_perfect_monthly
     assert "Contract Length=Monthly" in result["target_association_warnings"][0]
     assert "Age" in result["responsible_use_notes"][0]
     assert "Gender" in result["responsible_use_notes"][0]
+    assert any("1 missing value; <0.1% missing" in item for item in result["headlines"])
+    assert not any("biggest coverage risk" in item for item in result["data_quality_summary"])
 
 
 def test_churn_validation_fixture_reports_exact_counts_without_reusing_training_claims():

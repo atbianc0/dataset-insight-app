@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import re
+from numbers import Integral
 from typing import Any
 
 import pandas as pd
@@ -14,21 +16,179 @@ from src.modeling import (
     normalise_target,
 )
 
+MIN_EXTERNAL_EVALUATION_ROWS = 20
+MIN_EXTERNAL_CLASS_SUPPORT = 20
+LOWER_IS_BETTER_METRICS = {
+    "mae",
+    "mean_absolute_error",
+    "mean_squared_error",
+    "mse",
+    "rmse",
+    "root_mean_squared_error",
+}
+
 
 def _normalised_columns(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
-    original_to_normalised = {column: str(column).strip() for column in frame.columns}
-    normalised = list(original_to_normalised.values())
+    original_columns = list(frame.columns)
+    normalised = [str(column).strip() for column in original_columns]
     duplicates = pd.Index(normalised)[pd.Index(normalised).duplicated()].unique().tolist()
     if duplicates:
         raise ValueError(
             "Scoring dataset contains duplicate columns after trimming: " + ", ".join(duplicates)
         )
-    return frame.rename(columns=original_to_normalised).copy(), original_to_normalised
+    normalized_frame = frame.copy()
+    normalized_frame.columns = normalised
+    return normalized_frame, dict(zip(original_columns, normalised, strict=True))
 
 
 def _safe_probability_name(label: Any) -> str:
     token = re.sub(r"[^A-Za-z0-9]+", "_", str(label)).strip("_").lower() or "class"
     return f"probability_{token}"
+
+
+def _collision_free_output_name(base: str, occupied: set[Any]) -> str:
+    """Return a deterministic model-output name without replacing an input column."""
+
+    if base not in occupied:
+        occupied.add(base)
+        return base
+
+    model_base = f"model_{base}"
+    if model_base not in occupied:
+        occupied.add(model_base)
+        return model_base
+
+    suffix = 2
+    while f"{model_base}_{suffix}" in occupied:
+        suffix += 1
+    name = f"{model_base}_{suffix}"
+    occupied.add(name)
+    return name
+
+
+def _labels_equal(left: Any, right: Any) -> bool:
+    try:
+        result = left == right
+        if result is pd.NA or pd.isna(result):
+            return False
+        return bool(result)
+    except (TypeError, ValueError):
+        return False
+
+
+def _canonical_class_label(value: Any, class_labels: list[Any]) -> Any | None:
+    exact = [label for label in class_labels if _labels_equal(value, label)]
+    if len(exact) == 1:
+        return exact[0]
+
+    value_text = str(value).strip()
+    text_matches = [label for label in class_labels if value_text == str(label).strip()]
+    if len(text_matches) == 1:
+        return text_matches[0]
+
+    folded_matches = [
+        label for label in class_labels if value_text.casefold() == str(label).strip().casefold()
+    ]
+    return folded_matches[0] if len(folded_matches) == 1 else None
+
+
+def _normalise_external_target(
+    bundle: ModelBundle,
+    raw_target: pd.Series,
+) -> tuple[pd.Series | None, str | None]:
+    """Normalize a complete external target or explain why evaluation is unsafe."""
+
+    provided = raw_target.loc[raw_target.notna()]
+    if provided.empty:
+        return None, f"{bundle.target_column}: no non-missing target labels are available."
+
+    try:
+        normalised = normalise_target(provided, bundle.problem_type)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return None, f"{bundle.target_column}: target values could not be normalized ({exc})."
+
+    omitted_count = len(provided) - len(normalised)
+    if omitted_count:
+        return None, (
+            f"{bundle.target_column}: {omitted_count:,} provided target value(s) became missing or "
+            "invalid during normalization; external evaluation was not run."
+        )
+
+    if bundle.problem_type == "regression":
+        return normalised, None
+    if not bundle.class_labels:
+        return None, (
+            f"{bundle.target_column}: the model bundle has no training labels, so external "
+            "evaluation was not run."
+        )
+
+    canonical_values: list[Any] = []
+    unknown_values: list[Any] = []
+    for value in normalised.tolist():
+        canonical = _canonical_class_label(value, bundle.class_labels)
+        if canonical is None:
+            unknown_values.append(value)
+        else:
+            canonical_values.append(canonical)
+
+    if unknown_values:
+        examples = list(dict.fromkeys(str(value) for value in unknown_values))[:5]
+        return None, (
+            f"{bundle.target_column}: {len(unknown_values):,} target value(s) use labels not "
+            f"present in the model's training labels ({', '.join(examples)}); external "
+            "evaluation was not run."
+        )
+
+    return pd.Series(canonical_values, index=normalised.index, name=raw_target.name), None
+
+
+def _external_target_warning(bundle: ModelBundle, target: pd.Series) -> str | None:
+    if len(target) < MIN_EXTERNAL_EVALUATION_ROWS:
+        return (
+            f"{bundle.target_column}: external evaluation requires at least "
+            f"{MIN_EXTERNAL_EVALUATION_ROWS:,} labeled rows; found {len(target):,}. "
+            "Predictions were produced, but readiness remains provisional."
+        )
+    if bundle.problem_type == "classification" and target.nunique(dropna=False) < 2:
+        return (
+            f"{bundle.target_column}: the external target contains only one class. At least two "
+            "observed classes are required for comparative classification metrics, so readiness "
+            "remains provisional."
+        )
+    if bundle.problem_type == "classification":
+        observed = target.unique().tolist()
+        missing_labels = [
+            label
+            for label in bundle.class_labels
+            if not any(_labels_equal(label, value) for value in observed)
+        ]
+        if missing_labels:
+            missing_text = ", ".join(str(label) for label in missing_labels[:5])
+            return (
+                f"{bundle.target_column}: the external target has zero support for fitted "
+                f"class(es): {missing_text}. Every fitted class needs external support before "
+                "comparative classification metrics can establish readiness."
+            )
+        support = {
+            label: int(target.map(lambda value: _labels_equal(label, value)).sum())
+            for label in bundle.class_labels
+        }
+        low_support = {
+            label: count
+            for label, count in support.items()
+            if count < MIN_EXTERNAL_CLASS_SUPPORT
+        }
+        if low_support:
+            rendered = ", ".join(
+                f"{label}={count:,}" for label, count in list(low_support.items())[:5]
+            )
+            return (
+                f"{bundle.target_column}: stable external estimates require at least "
+                f"{MIN_EXTERNAL_CLASS_SUPPORT:,} observations per fitted class; low support "
+                f"was found for {rendered}. Predictions were produced, but uncertainty is too "
+                "high for an external validation claim."
+            )
+    return None
 
 
 def _coerce_schema(bundle: ModelBundle, frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -120,9 +280,12 @@ def compare_distributions(
         per_column[column] = payload
 
     identifier_overlap: dict[str, int] = {}
+    identifier_overlap_rate: dict[str, float] = {}
     for column, training_values in bundle.identifier_reference.items():
         if column in frame.columns:
-            identifier_overlap[column] = int(frame[column].dropna().isin(training_values).sum())
+            overlap = int(frame[column].dropna().isin(training_values).sum())
+            identifier_overlap[column] = overlap
+            identifier_overlap_rate[column] = float(overlap / max(len(frame), 1))
 
     target_prevalence_change = None
     if (
@@ -151,6 +314,8 @@ def compare_distributions(
         "max_unseen_category_rate": float(max_unseen),
         "target_prevalence_change": target_prevalence_change,
         "identifier_overlap": identifier_overlap,
+        "identifier_overlap_rate": identifier_overlap_rate,
+        "max_identifier_overlap_rate": float(max(identifier_overlap_rate.values(), default=0.0)),
         "identifier_overlap_total": int(sum(identifier_overlap.values())),
     }
 
@@ -159,6 +324,7 @@ def _readiness(
     bundle: ModelBundle,
     external_metrics: dict[str, Any] | None,
     external_baseline: dict[str, Any] | None,
+    drift_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if external_metrics is None or external_baseline is None:
         return {
@@ -166,40 +332,94 @@ def _readiness(
             "summary": "Internal holdout results are provisional until a labeled external dataset is evaluated.",
         }
 
-    if bundle.problem_type == "classification":
-        metric = bundle.primary_metric
-        if metric not in external_metrics or metric not in bundle.holdout_metrics:
-            metric = "balanced_accuracy"
-        internal_value = float(bundle.holdout_metrics[metric])
-        external_value = float(external_metrics[metric])
-        baseline_value = float(external_baseline[metric])
-        performance_drop = internal_value - external_value
-        close_to_baseline = external_value <= baseline_value + 0.05
-    else:
-        metric = "r2"
-        internal_value = float(bundle.holdout_metrics[metric])
-        external_value = float(external_metrics[metric])
-        baseline_value = float(external_baseline[metric])
-        performance_drop = internal_value - external_value
-        close_to_baseline = external_value <= baseline_value + 0.05
-
-    if performance_drop >= 0.10 or close_to_baseline:
+    evaluated_rows = external_metrics.get("evaluated_rows")
+    if not isinstance(evaluated_rows, Integral) or evaluated_rows < MIN_EXTERNAL_EVALUATION_ROWS:
         return {
-            "status": "not deployment-ready",
+            "status": "provisional",
             "summary": (
-                f"External {metric} is {external_value:.3f} versus {internal_value:.3f} internally "
-                f"and {baseline_value:.3f} for the train-derived baseline. Generalization is not reliable enough for deployment."
+                f"At least {MIN_EXTERNAL_EVALUATION_ROWS:,} labeled external rows are required "
+                "before making a validation claim."
             ),
+        }
+
+    metric = bundle.primary_metric
+    if (
+        not metric
+        or metric not in external_metrics
+        or metric not in external_baseline
+        or metric not in bundle.holdout_metrics
+    ):
+        return {
+            "status": "provisional",
+            "summary": (
+                f"The configured primary metric ({metric or 'unspecified'}) is unavailable or "
+                "incomplete, so no external validation claim was made."
+            ),
+        }
+
+    try:
+        internal_value = float(bundle.holdout_metrics[metric])
+        external_value = float(external_metrics[metric])
+        baseline_value = float(external_baseline[metric])
+    except (TypeError, ValueError):
+        return {
+            "status": "provisional",
+            "summary": (
+                f"The configured primary metric ({metric}) is not numeric, so no external "
+                "validation claim was made."
+            ),
+        }
+
+    if not all(math.isfinite(value) for value in (internal_value, external_value, baseline_value)):
+        return {
+            "status": "provisional",
+            "summary": (
+                f"The configured primary metric ({metric}) contains a non-finite value, so no "
+                "external validation claim was made."
+            ),
+        }
+
+    lower_is_better = metric.lower() in LOWER_IS_BETTER_METRICS
+    if lower_is_better:
+        performance_drop = external_value - internal_value
+        close_to_baseline = external_value >= baseline_value - 0.05
+        comparison = "below"
+    else:
+        performance_drop = internal_value - external_value
+        close_to_baseline = external_value <= baseline_value + 0.05
+        comparison = "above"
+
+    overlap_total = int((drift_summary or {}).get("identifier_overlap_total", 0) or 0)
+    if performance_drop >= 0.10 or close_to_baseline or overlap_total:
+        if performance_drop >= 0.10 or close_to_baseline:
+            summary = (
+                f"External {metric} is {external_value:.3f} versus {internal_value:.3f} "
+                f"internally and {baseline_value:.3f} for the train-derived baseline. "
+                "Generalization is not reliable enough for deployment."
+            )
+        else:
+            summary = (
+                f"External {metric} is {external_value:.3f}, but external rows overlap "
+                f"model-development entities ({overlap_total:,} matched identifier row(s)); "
+                "this file cannot establish independent validation."
+            )
+        payload = {
+            "status": "not deployment-ready",
+            "summary": summary,
             "metric": metric,
             "internal_value": internal_value,
             "external_value": external_value,
             "external_baseline_value": baseline_value,
             "performance_drop": performance_drop,
+            "metric_direction": "lower is better" if lower_is_better else "higher is better",
         }
+        if overlap_total:
+            payload["identifier_overlap_total"] = overlap_total
+        return payload
     return {
         "status": "externally validated",
         "summary": (
-            f"External {metric} is {external_value:.3f}; it remains meaningfully above the "
+            f"External {metric} is {external_value:.3f}; it remains meaningfully {comparison} the "
             "train-derived baseline without a material internal-to-external drop."
         ),
         "metric": metric,
@@ -207,6 +427,7 @@ def _readiness(
         "external_value": external_value,
         "external_baseline_value": baseline_value,
         "performance_drop": performance_drop,
+        "metric_direction": "lower is better" if lower_is_better else "higher is better",
     }
 
 
@@ -221,7 +442,8 @@ def score_or_evaluate(bundle: ModelBundle, raw_df: pd.DataFrame) -> ScoringResul
         raise ValueError("The scoring dataset contains no rows.")
 
     original = raw_df.copy()
-    working, _ = _normalised_columns(raw_df)
+    positional_input = raw_df.reset_index(drop=True)
+    working, _ = _normalised_columns(positional_input)
     working, schema_warnings = _coerce_schema(bundle, working)
     allowed = set(bundle.required_feature_columns + bundle.optional_identifier_columns + [bundle.target_column])
     extras = [column for column in working.columns if column not in allowed]
@@ -232,51 +454,63 @@ def score_or_evaluate(bundle: ModelBundle, raw_df: pd.DataFrame) -> ScoringResul
 
     predictions = bundle.predict(working)
     scored = original.copy()
-    prediction_column = "prediction" if "prediction" not in scored.columns else "model_prediction"
+    occupied_columns = set(scored.columns)
+    prediction_column = _collision_free_output_name("prediction", occupied_columns)
     scored[prediction_column] = predictions
 
     probabilities = None
+    probability_columns: dict[str, str] = {}
     if bundle.problem_type == "classification" and hasattr(bundle.pipeline, "predict_proba"):
         probabilities = bundle.predict_proba(working)
         for index, label in enumerate(bundle.class_labels):
-            name = _safe_probability_name(label)
-            if name in scored.columns:
-                name = "model_" + name
+            name = _collision_free_output_name(_safe_probability_name(label), occupied_columns)
             scored[name] = probabilities[:, index]
+            probability_columns[str(label)] = name
 
     external_metrics = None
     external_baseline = None
     valid_target = None
+    evaluation_status = "not_requested"
+    evaluation_warning = None
     if bundle.target_column in working.columns:
         raw_target = working[bundle.target_column]
-        valid_mask = raw_target.notna()
-        if valid_mask.any():
-            normalised = normalise_target(raw_target.loc[valid_mask], bundle.problem_type)
-            valid_index = normalised.index
-            valid_target = normalised
-            prediction_series = pd.Series(predictions, index=working.index).loc[valid_index]
-            probability_subset = None
-            if probabilities is not None:
-                probability_subset = probabilities[working.index.get_indexer(valid_index)]
-            external_metrics = evaluate_model_predictions(
-                bundle.problem_type,
-                valid_target,
-                prediction_series,
-                probabilities=probability_subset,
-                class_labels=bundle.class_labels,
-                positive_label=bundle.positive_label,
-            )
-            baseline_pred, baseline_probabilities = baseline_predictions(bundle, len(valid_target))
-            external_baseline = evaluate_model_predictions(
-                bundle.problem_type,
-                valid_target,
-                baseline_pred,
-                probabilities=baseline_probabilities,
-                class_labels=bundle.class_labels,
-                positive_label=bundle.positive_label,
-            )
-            external_metrics["evaluated_rows"] = int(len(valid_target))
-            external_metrics["baseline_metrics"] = external_baseline
+        valid_target, evaluation_warning = _normalise_external_target(bundle, raw_target)
+        if evaluation_warning is not None:
+            evaluation_status = "blocked"
+            schema_warnings.append(evaluation_warning)
+        elif valid_target is not None:
+            evaluation_warning = _external_target_warning(bundle, valid_target)
+            if evaluation_warning is not None:
+                evaluation_status = "blocked"
+                schema_warnings.append(evaluation_warning)
+            else:
+                evaluation_status = "completed"
+                valid_index = valid_target.index
+                prediction_series = pd.Series(predictions, index=working.index).loc[valid_index]
+                probability_subset = None
+                if probabilities is not None:
+                    probability_subset = probabilities[working.index.get_indexer(valid_index)]
+                external_metrics = evaluate_model_predictions(
+                    bundle.problem_type,
+                    valid_target,
+                    prediction_series,
+                    probabilities=probability_subset,
+                    class_labels=bundle.class_labels,
+                    positive_label=bundle.positive_label,
+                )
+                baseline_pred, baseline_probabilities = baseline_predictions(
+                    bundle, len(valid_target)
+                )
+                external_baseline = evaluate_model_predictions(
+                    bundle.problem_type,
+                    valid_target,
+                    baseline_pred,
+                    probabilities=baseline_probabilities,
+                    class_labels=bundle.class_labels,
+                    positive_label=bundle.positive_label,
+                )
+                external_metrics["evaluated_rows"] = int(len(valid_target))
+                external_metrics["baseline_metrics"] = external_baseline
 
     drift = compare_distributions(bundle, working, valid_target)
     for column, payload in drift["per_column"].items():
@@ -286,11 +520,30 @@ def score_or_evaluate(bundle: ModelBundle, raw_df: pd.DataFrame) -> ScoringResul
                 f"{column}: {unseen_rate:.1%} of rows contain categories not observed in "
                 "the model-training rows; they were handled without refitting."
             )
-    readiness = _readiness(bundle, external_metrics, external_baseline)
+    for column, overlap in drift["identifier_overlap"].items():
+        if overlap:
+            rate = float(drift["identifier_overlap_rate"].get(column, 0.0))
+            schema_warnings.append(
+                f"{column}: {overlap:,} row(s) ({rate:.1%}) overlap model-development "
+                "entities. External metrics are not independent validation evidence."
+            )
+    readiness = _readiness(bundle, external_metrics, external_baseline, drift)
+    if evaluation_status == "blocked":
+        readiness = {
+            "status": "provisional",
+            "summary": (
+                "External evaluation was blocked because the supplied target could not support "
+                "a safe comparison with the fitted model. Predictions were produced, but no "
+                "external validation claim was made."
+            ),
+        }
     return ScoringResult(
         scored_rows=scored,
         schema_warnings=schema_warnings,
         drift_summary=drift,
         external_metrics=external_metrics,
         readiness=readiness,
+        evaluation_status=evaluation_status,
+        prediction_column=prediction_column,
+        probability_columns=probability_columns,
     )

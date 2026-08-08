@@ -36,7 +36,7 @@ On Windows PowerShell, activate the environment with
 python -m ruff check app.py src tests
 python -m pytest -W error
 python -m pytest --cov=src --cov-branch --cov-report=term-missing
-python -m pip_audit -r requirements.txt
+python -m pip_audit -r requirements-dev.txt
 docker build --tag datalens:local .
 ```
 

@@ -13,6 +13,9 @@ def test_identifier_detection_uses_tokens_not_arbitrary_id_substrings():
     assert is_identifier_like(values, "video_score") is False
     assert is_identifier_like(values, "width") is False
 
+    repeated_entities = pd.Series([f"C{index:02d}" for index in range(10)] * 10)
+    assert is_identifier_like(repeated_entities, "CustomerID") is True
+
 
 def test_sample_values_stops_after_collecting_the_requested_unique_values():
     class RenderGuard:

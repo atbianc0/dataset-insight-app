@@ -21,11 +21,14 @@ severity and fix complexity.
 - DataLens does not need an OpenAI key for deterministic analysis.
 - Keep `.env` files and credentials out of Git. Rotate a key immediately if it
   is exposed.
-- Uploaded files are processed by the running application. Deployment-platform
-  logs, memory, network, and retention remain the operator's responsibility.
-- The optional AI assistant sends an aggregate/schema analysis context to the
-  configured OpenAI API only after the user enables it. Do not enable external
-  processing for data you are not authorized to share.
+- Uploaded files are sent to the running application and held in server-side
+  session memory. Deployment-platform logs, memory, network, and retention
+  remain the operator's responsibility.
+- The optional AI assistant sends an explicitly allowlisted aggregate/schema
+  context to the configured OpenAI API only after the user enables it. The
+  payload excludes uploaded rows, sample values, category labels/counts,
+  identifier or name values, derived headlines, and free-text findings. Do not
+  enable external processing for data you are not authorized to share.
 - CSV downloads escape spreadsheet-formula prefixes, but recipients should
   still treat exported files as untrusted input.
 
