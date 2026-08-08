@@ -3,6 +3,6 @@ pandas==2.3.3
 numpy==2.4.4
 scikit-learn==1.8.0
 streamlit==1.56.0
-matplotlib==3.10.8
+matplotlib==3.11.1
 openpyxl==3.1.5
 openai==2.53.0
