@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+.pytest_cache
+.ruff_cache
+.coverage
+coverage.xml
+__pycache__
+*.py[cod]
+*.pkl
+.DS_Store
+models
+outputs
+tests
+PROJECT_BREAKDOWN.md

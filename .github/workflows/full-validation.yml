@@ -1,0 +1,57 @@
+name: Full fixture validation
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  full-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DATALENS_EXTERNAL_VALIDATION_ROWS: "64374"
+      DATALENS_FULL_FIXTURES: "1"
+      DATALENS_MODEL_SAMPLE_ROWS: "60000"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install development environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --requirement requirements-dev.txt
+      - name: Verify fixture hashes and schemas
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          import pandas as pd
+
+          manifest = json.loads(Path("sample_data/fixtures.json").read_text())
+          for fixture in manifest["fixtures"]:
+              path = Path(fixture["path"])
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              assert digest == fixture["sha256"], path
+              assert path.stat().st_size == fixture["byte_size"], path
+              frame = pd.read_csv(path)
+              expected = fixture["expected_facts"]
+              assert len(frame) == expected["row_count"], path
+              assert list(frame.columns) == fixture["schema"]["columns"], path
+          PY
+      - name: Run full suite
+        run: python -m pytest -W error

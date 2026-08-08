@@ -1,0 +1,76 @@
+{
+  "benchmark_version": "1.0",
+  "recorded_at": "2026-08-08",
+  "machine": {
+    "model": "Apple M1",
+    "memory_gib": 16,
+    "operating_system": "macOS 26.5.1",
+    "python": "3.11.5"
+  },
+  "configuration": {
+    "effort": "standard",
+    "cross_validation_folds": 3,
+    "model_sample_rows": 60000,
+    "external_validation_rows": 64374,
+    "random_seed": 42,
+    "holdout_fraction": 0.2
+  },
+  "fixtures": {
+    "netflix_titles.csv": "df1f4ad2027a5a14c3a33932ef0d4054565ff88adf92b7f263601b70fdc6f3f3",
+    "customer_churn_dataset-training-master.csv": "a41be7b96fb85110521bf03d1530879e9ca94b9f5de19866757f6d184300fff7",
+    "customer_churn_dataset-testing-master.csv": "330af932f2dc1cae917f3bd0fb29395c4021319dd906189b7dc257d0ad58a617"
+  },
+  "results": {
+    "parse_seconds": {
+      "netflix": 0.049,
+      "churn_testing": 0.055,
+      "churn_training": 0.371
+    },
+    "profile_only_seconds": {
+      "netflix": 0.192,
+      "churn_testing": 0.27,
+      "churn_training": 2.041
+    },
+    "profile_seconds": {
+      "netflix": 0.244,
+      "churn_testing": 0.327,
+      "churn_training": 2.412
+    },
+    "workflow_ranking_seconds": 8.606,
+    "standard_training_seconds": 9.892,
+    "external_scoring_seconds": 0.906,
+    "standard_training_and_external_evaluation_seconds": 10.798,
+    "workflow_training_and_external_evaluation_seconds": 19.404,
+    "complete_journey_seconds": 22.161,
+    "workflow_peak_resident_bytes": 753549312,
+    "workflow_peak_resident_gib": 0.702,
+    "external_rows_scored": 64374,
+    "overlapping_identifiers": 62995,
+    "internal_average_precision": 0.999999,
+    "external_average_precision": 0.618244,
+    "external_roc_auc": 0.7234,
+    "external_balanced_accuracy": 0.5283,
+    "external_baseline_average_precision": 0.473685,
+    "readiness": "not deployment-ready"
+  },
+  "verification": {
+    "full_suite_runs": [
+      {
+        "tests_passed": 110,
+        "pytest_seconds": 71.26
+      },
+      {
+        "tests_passed": 110,
+        "pytest_seconds": 72.71
+      }
+    ],
+    "note": "Profile values are median parse-plus-profile wall times from three runs. The peak-memory release target applies to the fresh-process application workflow, not the test runner."
+  },
+  "targets": {
+    "netflix_profile_seconds": 3,
+    "churn_testing_profile_seconds": 8,
+    "churn_training_profile_seconds": 20,
+    "standard_training_and_external_evaluation_seconds": 60,
+    "peak_memory_bytes": 1500000000
+  }
+}

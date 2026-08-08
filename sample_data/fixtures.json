@@ -1,0 +1,166 @@
+{
+  "manifest_version": 1,
+  "hash_algorithm": "sha256",
+  "replacement_policy": "Update the file, source, license, schema, hash, and expected facts together.",
+  "fixtures": [
+    {
+      "id": "netflix_titles",
+      "path": "sample_data/netflix_titles.csv",
+      "sha256": "df1f4ad2027a5a14c3a33932ef0d4054565ff88adf92b7f263601b70fdc6f3f3",
+      "byte_size": 3399671,
+      "source": {
+        "title": "Netflix Movies and TV Shows",
+        "publisher": "Shivam Bansal",
+        "url": "https://www.kaggle.com/datasets/shivamb/netflix-shows"
+      },
+      "license": {
+        "spdx": "CC0-1.0",
+        "name": "CC0 1.0 Universal",
+        "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "text_path": "sample_data/LICENSES/CC0-1.0.txt"
+      },
+      "schema": {
+        "column_count": 12,
+        "columns": [
+          "show_id",
+          "type",
+          "title",
+          "director",
+          "cast",
+          "country",
+          "date_added",
+          "release_year",
+          "rating",
+          "duration",
+          "listed_in",
+          "description"
+        ]
+      },
+      "expected_facts": {
+        "row_count": 8807,
+        "raw_missing_cells": 4307,
+        "sanitized_missing_cells": 4308,
+        "type_counts": {
+          "Movie": 6131,
+          "TV Show": 2676
+        },
+        "director_missing_count": 2634,
+        "director_missing_rate": 0.29908027705234474,
+        "date_added_non_null_count": 8797,
+        "date_added_max": "2021-09-25",
+        "partial_final_year": 2021,
+        "movie_duration_minutes": {
+          "count": 6128,
+          "median": 98.0
+        },
+        "tv_duration_seasons": {
+          "count": 2676,
+          "median": 1.0
+        },
+        "leading_exploded_genre": {
+          "value": "International Movies",
+          "count": 2752
+        },
+        "leading_exploded_country": {
+          "value": "United States",
+          "count": 3690
+        },
+        "leading_rating": {
+          "value": "TV-MA",
+          "count": 3207
+        }
+      }
+    },
+    {
+      "id": "customer_churn_training",
+      "path": "sample_data/customer_churn_dataset-training-master.csv",
+      "sha256": "a41be7b96fb85110521bf03d1530879e9ca94b9f5de19866757f6d184300fff7",
+      "byte_size": 23448754,
+      "source": {
+        "title": "Customer Churn Dataset",
+        "publisher": "Muhammad Shahid Azeem",
+        "url": "https://www.kaggle.com/datasets/muhammadshahidazeem/customer-churn-dataset"
+      },
+      "license": {
+        "spdx": "GPL-2.0-only",
+        "name": "GNU General Public License v2.0",
+        "url": "https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html",
+        "text_path": "sample_data/LICENSES/GPL-2.0-only.txt"
+      },
+      "schema": {
+        "column_count": 12,
+        "columns": [
+          "CustomerID",
+          "Age",
+          "Gender",
+          "Tenure",
+          "Usage Frequency",
+          "Support Calls",
+          "Payment Delay",
+          "Subscription Type",
+          "Contract Length",
+          "Total Spend",
+          "Last Interaction",
+          "Churn"
+        ],
+        "identifier": "CustomerID",
+        "target": "Churn",
+        "positive_label": 1
+      },
+      "expected_facts": {
+        "row_count": 440833,
+        "raw_missing_cells": 12,
+        "fully_blank_rows": 1,
+        "usable_target_rows": 440832,
+        "positive_target_count": 249999,
+        "positive_target_rate": 0.5671071972996515,
+        "monthly_contract_rows": 87104,
+        "monthly_contract_positive_rate": 1.0
+      }
+    },
+    {
+      "id": "customer_churn_testing",
+      "path": "sample_data/customer_churn_dataset-testing-master.csv",
+      "sha256": "330af932f2dc1cae917f3bd0fb29395c4021319dd906189b7dc257d0ad58a617",
+      "byte_size": 3282220,
+      "source": {
+        "title": "Customer Churn Dataset",
+        "publisher": "Muhammad Shahid Azeem",
+        "url": "https://www.kaggle.com/datasets/muhammadshahidazeem/customer-churn-dataset"
+      },
+      "license": {
+        "spdx": "GPL-2.0-only",
+        "name": "GNU General Public License v2.0",
+        "url": "https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html",
+        "text_path": "sample_data/LICENSES/GPL-2.0-only.txt"
+      },
+      "schema": {
+        "column_count": 12,
+        "columns": [
+          "CustomerID",
+          "Age",
+          "Gender",
+          "Tenure",
+          "Usage Frequency",
+          "Support Calls",
+          "Payment Delay",
+          "Subscription Type",
+          "Contract Length",
+          "Total Spend",
+          "Last Interaction",
+          "Churn"
+        ],
+        "identifier": "CustomerID",
+        "target": "Churn",
+        "positive_label": 1
+      },
+      "expected_facts": {
+        "row_count": 64374,
+        "raw_missing_cells": 0,
+        "positive_target_count": 30493,
+        "positive_target_rate": 0.47368502811694163,
+        "training_identifier_overlap_count": 62995
+      }
+    }
+  ]
+}

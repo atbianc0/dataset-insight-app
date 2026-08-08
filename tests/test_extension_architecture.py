@@ -1,11 +1,11 @@
 import pandas as pd
 
+from src import pipeline
 from src.extensions import (
     HeuristicPipelineExtension,
     PipelineExtension,
     PipelineExtensionRegistry,
 )
-from src import pipeline
 
 
 def make_prediction_ready_frame(rows=120):

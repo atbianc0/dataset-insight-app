@@ -1,4 +1,7 @@
+from pathlib import Path
+
 import pandas as pd
+import pytest
 
 from src import pipeline
 
@@ -74,6 +77,121 @@ def test_dataset_workflow_prefers_insights_without_strong_target():
     assert "insight-focused analysis" in workflow["summary"].lower()
 
 
+def test_netflix_type_is_modelable_but_never_auto_selected_as_an_outcome():
+    fixture = Path(__file__).resolve().parents[1] / "sample_data/netflix_titles.csv"
+
+    workflow = pipeline.recommend_dataset_workflow(pd.read_csv(fixture))
+
+    assert workflow["recommended_workflow"] == "insights"
+    assert workflow["recommended_primary_target"] is None
+    assert "type" in workflow["candidate_lookup"]
+
+
+def test_pipeline_sanitizer_rejects_normalized_duplicate_headers():
+    frame = pd.DataFrame([[1, 2]], columns=["value", " value "])
+
+    with pytest.raises(ValueError, match="unique after trimming"):
+        pipeline.sanitize_dataframe(frame)
+
+
+def test_pipeline_sanitizer_leaves_feature_type_learning_to_training_rows():
+    frame = pd.DataFrame(
+        {
+            "numeric_text": pd.Series([str(index) for index in range(95)] + ["bad"] * 5),
+            "Churn": [0, 1] * 50,
+        }
+    )
+
+    prepared = pipeline.prepare_training_frame(frame, "Churn")
+
+    assert pd.api.types.is_string_dtype(prepared["X"]["numeric_text"])
+    assert prepared["X"]["numeric_text"].iloc[-1] == "bad"
+
+
+def test_run_analysis_forwards_selected_seed_to_bounded_sampling(monkeypatch):
+    observed = {}
+    original = pipeline.sample_training_data
+
+    def capture_seed(X, y, problem_type, max_rows=pipeline.MAX_TRAIN_ROWS, random_state=42):
+        observed["random_state"] = random_state
+        return original(
+            X,
+            y,
+            problem_type,
+            max_rows=max_rows,
+            random_state=random_state,
+        )
+
+    monkeypatch.setattr(pipeline, "sample_training_data", capture_seed)
+
+    result = pipeline.run_analysis(
+        make_prediction_ready_frame(),
+        "churn_status",
+        random_state=731,
+    )
+
+    assert observed["random_state"] == 731
+    assert result["model_bundle"].random_seed == 731
+
+
+def test_run_analysis_retargets_cached_insights_and_positive_label():
+    rows = 180
+    outcome = pd.Series(["approve", "deny"] * (rows // 2), dtype="string")
+    frame = pd.DataFrame(
+        {
+            "signal_measure": [
+                (0 if label == "approve" else 10) + (index % 7) / 100
+                for index, label in enumerate(outcome)
+            ],
+            "segment": ["A", "B", "C"] * (rows // 3),
+            "Churn": [0, 0, 1] * (rows // 3),
+            "Outcome2": outcome,
+        }
+    )
+    workflow = pipeline.recommend_dataset_workflow(frame)
+    assert workflow["insight_analysis"]["association_target"] == "Churn"
+
+    result = pipeline.run_analysis(
+        frame,
+        "Outcome2",
+        positive_label="approve",
+        precomputed_workflow=workflow,
+    )
+    insights = result["insight_analysis"]
+
+    assert result["mode"] == "prediction"
+    assert result["positive_label"] == "approve"
+    assert insights["association_target"] == "Outcome2"
+    assert insights["association_target_inferred"] is False
+    assert insights["target_overview"]["positive_label"] == "approve"
+    assert all(not item.startswith("Churn is associated") for item in insights["headlines"])
+    assert workflow["insight_analysis"]["association_target"] == "Churn"
+
+
+def test_run_analysis_uses_the_fitted_binary_positive_label_in_insights():
+    rows = 240
+    outcome = pd.Series(["approve"] * 60 + ["deny"] * 180, dtype="string")
+    frame = pd.DataFrame(
+        {
+            "signal_group": [
+                "eligible" if label == "approve" else "ineligible" for label in outcome
+            ],
+            "review_score": [index % 17 for index in range(rows)],
+            "Outcome": outcome,
+        }
+    )
+
+    result = pipeline.run_analysis(frame, "Outcome", random_state=17)
+
+    assert result["mode"] == "prediction"
+    assert result["positive_label"] == "approve"
+    assert result["model_bundle"].positive_label == "approve"
+    assert result["insight_analysis"]["target_overview"]["positive_label"] == "approve"
+    assert result["dataset_recommendation"]["insight_analysis"]["target_overview"][
+        "positive_label"
+    ] == "approve"
+
+
 def test_multi_target_grouping_surfaces_related_targets():
     df = pd.DataFrame(
         {
@@ -118,6 +236,8 @@ def test_run_analysis_falls_back_to_insights_when_model_quality_is_weak(monkeypa
             "best_model_name": "Dummy Model",
             "best_model": DummyBestModel(),
             "best_metrics": {"accuracy": 0.5, "precision": 0.25, "recall": 0.5, "f1": 0.333},
+            "baseline_metrics": {"f1": 0.333},
+            "feature_importance": pd.DataFrame(columns=["feature", "importance"]),
             "metric_name": "f1",
             "X_test": X.head(4).reset_index(drop=True),
             "y_test": y_test,
@@ -128,11 +248,6 @@ def test_run_analysis_falls_back_to_insights_when_model_quality_is_weak(monkeypa
         }
 
     monkeypatch.setattr(pipeline, "train_best_model", fake_train_best_model)
-    monkeypatch.setattr(
-        pipeline,
-        "build_feature_importance",
-        lambda best_model, feature_names: pd.DataFrame(columns=["feature", "importance"]),
-    )
     monkeypatch.setattr(
         pipeline,
         "build_chart_context",
